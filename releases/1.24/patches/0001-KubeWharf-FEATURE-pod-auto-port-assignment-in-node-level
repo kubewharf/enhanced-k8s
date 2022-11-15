@@ -1,0 +1,1518 @@
+diff --git a/cmd/kubelet/app/options/options.go b/cmd/kubelet/app/options/options.go
+index 986c638bce1..c7a1bb2e7ac 100644
+--- a/cmd/kubelet/app/options/options.go
++++ b/cmd/kubelet/app/options/options.go
+@@ -504,6 +504,7 @@ func AddKubeletConfigFlags(mainfs *pflag.FlagSet, c *kubeletconfig.KubeletConfig
+ 
+ 	// Graduated experimental flags, kept for backward compatibility
+ 	fs.BoolVar(&c.KernelMemcgNotification, "experimental-kernel-memcg-notification", c.KernelMemcgNotification, "Use kernelMemcgNotification configuration, this flag will be removed in 1.24 or later.")
++	fs.Var(&c.HostPortRange, "host-port-range", "A port range to reserve for dynamic host port, inclusive at both ends of the range. [default='9200-9500']")
+ 
+ 	// Memory Manager Flags
+ 	fs.StringVar(&c.MemoryManagerPolicy, "memory-manager-policy", c.MemoryManagerPolicy, "Memory Manager policy to use. Possible values: 'None', 'Static'.")
+diff --git a/pkg/api/v1/pod/util.go b/pkg/api/v1/pod/util.go
+index 8bfc21a67f4..f4abd82fa32 100644
+--- a/pkg/api/v1/pod/util.go
++++ b/pkg/api/v1/pod/util.go
+@@ -27,6 +27,10 @@ import (
+ 	"k8s.io/kubernetes/pkg/features"
+ )
+ 
++const (
++	PodAutoPortAnnotation = "pod.kubewharf.kubernetes.io/autoport"
++)
++
+ // FindPort locates the container port for the given pod and portName.  If the
+ // targetPort is a number, use that.  If the targetPort is a string, look that
+ // string up in all named ports in all containers in the target pod.  If no
+diff --git a/pkg/apis/core/validation/validation.go b/pkg/apis/core/validation/validation.go
+index 6357a631f94..45ed83ab094 100644
+--- a/pkg/apis/core/validation/validation.go
++++ b/pkg/apis/core/validation/validation.go
+@@ -44,8 +44,8 @@ import (
+ 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+ 	schedulinghelper "k8s.io/component-helpers/scheduling/corev1"
+ 	apiservice "k8s.io/kubernetes/pkg/api/service"
++	utilpod "k8s.io/kubernetes/pkg/api/v1/pod"
+ 	"k8s.io/kubernetes/pkg/apis/core"
+-	api "k8s.io/kubernetes/pkg/apis/core"
+ 	"k8s.io/kubernetes/pkg/apis/core/helper"
+ 	podshelper "k8s.io/kubernetes/pkg/apis/core/pods"
+ 	corev1 "k8s.io/kubernetes/pkg/apis/core/v1"
+@@ -2266,7 +2266,7 @@ func ValidatePersistentVolumeClaimStatusUpdate(newPvc, oldPvc *core.PersistentVo
+ 
+ var supportedPortProtocols = sets.NewString(string(core.ProtocolTCP), string(core.ProtocolUDP), string(core.ProtocolSCTP))
+ 
+-func validateContainerPorts(ports []core.ContainerPort, fldPath *field.Path) field.ErrorList {
++func validateContainerPorts(isAutoport bool, isHostNetwork bool, ports []core.ContainerPort, fldPath *field.Path) field.ErrorList {
+ 	allErrs := field.ErrorList{}
+ 
+ 	allNames := sets.String{}
+@@ -2284,7 +2284,11 @@ func validateContainerPorts(ports []core.ContainerPort, fldPath *field.Path) fie
+ 			}
+ 		}
+ 		if port.ContainerPort == 0 {
+-			allErrs = append(allErrs, field.Required(idxPath.Child("containerPort"), ""))
++			// this is only allowed when autoport is enabled with host network (autoport will assign both container port and host port)
++			// container port == hostport is validated in validateHostNetwork function
++			if !isHostNetwork || !isAutoport {
++				allErrs = append(allErrs, field.Required(idxPath.Child("containerPort"), ""))
++			}
+ 		} else {
+ 			for _, msg := range validation.IsValidPortNum(int(port.ContainerPort)) {
+ 				allErrs = append(allErrs, field.Invalid(idxPath.Child("containerPort"), port.ContainerPort, msg))
+@@ -2905,7 +2909,7 @@ func validatePullPolicy(policy core.PullPolicy, fldPath *field.Path) field.Error
+ 	return allErrors
+ }
+ 
+-func validateEphemeralContainers(ephemeralContainers []core.EphemeralContainer, containers, initContainers []core.Container, volumes map[string]core.VolumeSource, fldPath *field.Path, opts PodValidationOptions) field.ErrorList {
++func validateEphemeralContainers(isHostNetwork bool, ephemeralContainers []core.EphemeralContainer, containers, initContainers []core.Container, volumes map[string]core.VolumeSource, fldPath *field.Path, opts PodValidationOptions) field.ErrorList {
+ 	allErrs := field.ErrorList{}
+ 
+ 	if len(ephemeralContainers) == 0 {
+@@ -2937,7 +2941,8 @@ func validateEphemeralContainers(ephemeralContainers []core.EphemeralContainer,
+ 		// of ephemeralContainers[0].spec.name)
+ 		// TODO(verb): factor a validateContainer() out of validateContainers() to be used here
+ 		c := core.Container(ec.EphemeralContainerCommon)
+-		allErrs = append(allErrs, validateContainers([]core.Container{c}, false, volumes, idxPath, opts)...)
++		// autoport does not support ephemeral containers, so we simply pass isAutoport = false
++		allErrs = append(allErrs, validateContainers(false, isHostNetwork, []core.Container{c}, false, volumes, idxPath, opts)...)
+ 		// EphemeralContainers don't require the backwards-compatibility distinction between pod/podTemplate validation
+ 		allErrs = append(allErrs, validateContainersOnlyForPod([]core.Container{c}, idxPath)...)
+ 
+@@ -2991,10 +2996,11 @@ func validateFieldAllowList(value interface{}, allowedFields map[string]bool, er
+ 	return allErrs
+ }
+ 
+-func validateInitContainers(containers []core.Container, otherContainers []core.Container, deviceVolumes map[string]core.VolumeSource, fldPath *field.Path, opts PodValidationOptions) field.ErrorList {
++func validateInitContainers(isHostNetwork bool, containers []core.Container, otherContainers []core.Container, deviceVolumes map[string]core.VolumeSource, fldPath *field.Path, opts PodValidationOptions) field.ErrorList {
+ 	var allErrs field.ErrorList
+ 	if len(containers) > 0 {
+-		allErrs = append(allErrs, validateContainers(containers, true, deviceVolumes, fldPath, opts)...)
++		// autoport does not support init containers, so we simply pass isAutoport = false
++		allErrs = append(allErrs, validateContainers(false, isHostNetwork, containers, true, deviceVolumes, fldPath, opts)...)
+ 	}
+ 
+ 	allNames := sets.String{}
+@@ -3025,7 +3031,7 @@ func validateInitContainers(containers []core.Container, otherContainers []core.
+ 	return allErrs
+ }
+ 
+-func validateContainers(containers []core.Container, isInitContainers bool, volumes map[string]core.VolumeSource, fldPath *field.Path, opts PodValidationOptions) field.ErrorList {
++func validateContainers(isAutoPort bool, isHostNetwork bool, containers []core.Container, isInitContainers bool, volumes map[string]core.VolumeSource, fldPath *field.Path, opts PodValidationOptions) field.ErrorList {
+ 	allErrs := field.ErrorList{}
+ 
+ 	if len(containers) == 0 {
+@@ -3083,7 +3089,7 @@ func validateContainers(containers []core.Container, isInitContainers bool, volu
+ 		}
+ 
+ 		allErrs = append(allErrs, validateProbe(ctr.ReadinessProbe, idxPath.Child("readinessProbe"))...)
+-		allErrs = append(allErrs, validateContainerPorts(ctr.Ports, idxPath.Child("ports"))...)
++		allErrs = append(allErrs, validateContainerPorts(isAutoPort, isHostNetwork, ctr.Ports, idxPath.Child("ports"))...)
+ 		allErrs = append(allErrs, ValidateEnv(ctr.Env, idxPath.Child("env"), opts)...)
+ 		allErrs = append(allErrs, ValidateEnvFrom(ctr.EnvFrom, idxPath.Child("envFrom"))...)
+ 		allErrs = append(allErrs, ValidateVolumeMounts(ctr.VolumeMounts, volDevices, volumes, &ctr, idxPath.Child("volumeMounts"))...)
+@@ -3503,13 +3509,22 @@ func validatePodIPs(pod *core.Pod) field.ErrorList {
+ // The pod metadata is needed to validate generic ephemeral volumes. It is optional
+ // and should be left empty unless the spec is from a real pod object.
+ func ValidatePodSpec(spec *core.PodSpec, podMeta *metav1.ObjectMeta, fldPath *field.Path, opts PodValidationOptions) field.ErrorList {
++	isHostNetwork := false
++	if spec.SecurityContext != nil {
++		isHostNetwork = spec.SecurityContext.HostNetwork
++	}
++	isAutoport := false
++	if podMeta != nil && podMeta.Annotations != nil {
++		_, isAutoport = podMeta.Annotations[utilpod.PodAutoPortAnnotation]
++	}
++
+ 	allErrs := field.ErrorList{}
+ 
+ 	vols, vErrs := ValidateVolumes(spec.Volumes, podMeta, fldPath.Child("volumes"), opts)
+ 	allErrs = append(allErrs, vErrs...)
+-	allErrs = append(allErrs, validateContainers(spec.Containers, false, vols, fldPath.Child("containers"), opts)...)
+-	allErrs = append(allErrs, validateInitContainers(spec.InitContainers, spec.Containers, vols, fldPath.Child("initContainers"), opts)...)
+-	allErrs = append(allErrs, validateEphemeralContainers(spec.EphemeralContainers, spec.Containers, spec.InitContainers, vols, fldPath.Child("ephemeralContainers"), opts)...)
++	allErrs = append(allErrs, validateContainers(isAutoport, isHostNetwork, spec.Containers, false, vols, fldPath.Child("containers"), opts)...)
++	allErrs = append(allErrs, validateInitContainers(isHostNetwork, spec.InitContainers, spec.Containers, vols, fldPath.Child("initContainers"), opts)...)
++	allErrs = append(allErrs, validateEphemeralContainers(isHostNetwork, spec.EphemeralContainers, spec.Containers, spec.InitContainers, vols, fldPath.Child("ephemeralContainers"), opts)...)
+ 	allErrs = append(allErrs, validateRestartPolicy(&spec.RestartPolicy, fldPath.Child("restartPolicy"))...)
+ 	allErrs = append(allErrs, validateDNSPolicy(&spec.DNSPolicy, fldPath.Child("dnsPolicy"))...)
+ 	allErrs = append(allErrs, unversionedvalidation.ValidateLabels(spec.NodeSelector, fldPath.Child("nodeSelector"))...)
+@@ -4288,6 +4303,13 @@ func ValidatePodUpdate(newPod, oldPod *core.Pod, opts PodValidationOptions) fiel
+ 	// 2.  spec.initContainers[*].image
+ 	// 3.  spec.activeDeadlineSeconds
+ 	// 4.  spec.terminationGracePeriodSeconds
++	// if autoport is enabled:
++	// 1. spec.containers[*].ports[*].hostport (if previous value was 0)
++	// 2. spec.containers[*].env (we can add PORT, PORT0... env values)
++	// if autoport and hostnetwork is enabled:
++	// 1. spec.containers[*].ports[*].hostport (if previous value was 0)
++	// 2. spec.containers[*].ports[*].containerport (if previous value was 0)
++	// 3. spec.containers[*].env (we can add PORT, PORT0... env values)
+ 
+ 	containerErrs, stop := ValidateContainerUpdates(newPod.Spec.Containers, oldPod.Spec.Containers, specPath.Child("containers"))
+ 	allErrs = append(allErrs, containerErrs...)
+@@ -4323,6 +4345,24 @@ func ValidatePodUpdate(newPod, oldPod *core.Pod, opts PodValidationOptions) fiel
+ 	// Allow only additions to tolerations updates.
+ 	allErrs = append(allErrs, validateOnlyAddedTolerations(newPod.Spec.Tolerations, oldPod.Spec.Tolerations, specPath.Child("tolerations"))...)
+ 
++	isAutoport := false
++	if newPod.ObjectMeta.Annotations != nil {
++		_, isAutoport = newPod.ObjectMeta.Annotations[utilpod.PodAutoPortAnnotation]
++	}
++
++	if isAutoport {
++		isHostNetwork := false
++		if newPod.Spec.SecurityContext != nil {
++			isHostNetwork = newPod.Spec.SecurityContext.HostNetwork
++		}
++
++		errs := ValidateContainerUpdatesForAutoport(isHostNetwork, newPod.Spec.Containers, oldPod.Spec.Containers, specPath.Child("containers"))
++		allErrs = append(allErrs, errs...)
++		if len(allErrs) > 0 {
++			return allErrs
++		}
++	}
++
+ 	// the last thing to check is pod spec equality.  If the pod specs are equal, then we can simply return the errors we have
+ 	// so far and save the cost of a deep copy.
+ 	if apiequality.Semantic.DeepEqual(newPod.Spec, oldPod.Spec) {
+@@ -4332,9 +4372,14 @@ func ValidatePodUpdate(newPod, oldPod *core.Pod, opts PodValidationOptions) fiel
+ 	// handle updateable fields by munging those fields prior to deep equal comparison.
+ 	mungedPodSpec := *newPod.Spec.DeepCopy()
+ 	// munge spec.containers[*].image
++	// munge spec.containers[*].ports and spec.containers[*].env if autoport is enabled
+ 	var newContainers []core.Container
+ 	for ix, container := range mungedPodSpec.Containers {
+ 		container.Image = oldPod.Spec.Containers[ix].Image // +k8s:verify-mutation:reason=clone
++		if isAutoport {
++			container.Ports = oldPod.Spec.Containers[ix].Ports
++			container.Env = oldPod.Spec.Containers[ix].Env
++		}
+ 		newContainers = append(newContainers, container)
+ 	}
+ 	mungedPodSpec.Containers = newContainers
+@@ -4364,7 +4409,11 @@ func ValidatePodUpdate(newPod, oldPod *core.Pod, opts PodValidationOptions) fiel
+ 		// This diff isn't perfect, but it's a helluva lot better an "I'm not going to tell you what the difference is".
+ 		//TODO: Pinpoint the specific field that causes the invalid error after we have strategic merge diff
+ 		specDiff := cmp.Diff(oldPod.Spec, mungedPodSpec)
+-		allErrs = append(allErrs, field.Forbidden(specPath, fmt.Sprintf("pod updates may not change fields other than `spec.containers[*].image`, `spec.initContainers[*].image`, `spec.activeDeadlineSeconds`, `spec.tolerations` (only additions to existing tolerations) or `spec.terminationGracePeriodSeconds` (allow it to be set to 1 if it was previously negative)\n%v", specDiff)))
++		if isAutoport {
++			allErrs = append(allErrs, field.Forbidden(specPath, fmt.Sprintf("pod updates may not change fields other than `spec.containers[*].image`, `spec.initContainers[*].image`, `spec.activeDeadlineSeconds`, `spec.tolerations` (only additions to existing tolerations), `spec.terminationGracePeriodSeconds` (allow it to be set to 1 if it was previously negative), `spec.containers[*].ports` (if it was not previously assigned) or `spec.containers[*].env` (if autoport is updated)\n%v", specDiff)))
++		} else {
++			allErrs = append(allErrs, field.Forbidden(specPath, fmt.Sprintf("pod updates may not change fields other than `spec.containers[*].image`, `spec.initContainers[*].image`, `spec.activeDeadlineSeconds`, `spec.tolerations` (only additions to existing tolerations) or `spec.terminationGracePeriodSeconds` (allow it to be set to 1 if it was previously negative)\n%v", specDiff)))
++		}
+ 	}
+ 
+ 	return allErrs
+@@ -4736,7 +4785,7 @@ func validateServicePort(sp *core.ServicePort, requireName, isHeadlessService bo
+ 	return allErrs
+ }
+ 
+-func needsExternalTrafficPolicy(svc *api.Service) bool {
++func needsExternalTrafficPolicy(svc *core.Service) bool {
+ 	return svc.Spec.Type == core.ServiceTypeLoadBalancer || svc.Spec.Type == core.ServiceTypeNodePort
+ }
+ 
+@@ -4781,7 +4830,7 @@ func validateServiceExternalTrafficPolicy(service *core.Service) field.ErrorList
+ 	return allErrs
+ }
+ 
+-func validateServiceExternalTrafficFieldsUpdate(before, after *api.Service) field.ErrorList {
++func validateServiceExternalTrafficFieldsUpdate(before, after *core.Service) field.ErrorList {
+ 	allErrs := field.ErrorList{}
+ 
+ 	if apiservice.NeedsHealthCheck(before) && apiservice.NeedsHealthCheck(after) {
+@@ -6867,3 +6916,110 @@ func sameLoadBalancerClass(oldService, service *core.Service) bool {
+ 	}
+ 	return *oldService.Spec.LoadBalancerClass == *service.Spec.LoadBalancerClass
+ }
++
++func ValidateContainerUpdatesForAutoport(isHostNetwork bool, newContainers, oldContainers []core.Container, fldPath *field.Path) field.ErrorList {
++	var allErrs field.ErrorList
++
++	for ix, newC := range newContainers {
++		oldC := oldContainers[ix]
++		chldPath := fldPath.Child("containers").Index(ix)
++		assignedPorts := 0
++
++		// check ports
++		if len(newC.Ports) != len(oldC.Ports) {
++			allErrs = append(allErrs, field.Invalid(chldPath.Child("ports"), newC.Ports, "(autoport) must not add or remove ports"))
++			continue
++		}
++
++		var containerErrs field.ErrorList
++		for iy, newP := range newC.Ports {
++			oldP := oldC.Ports[iy]
++
++			// name, protocol, host ip should not be changed
++			if newP.Name != oldP.Name {
++				containerErrs = append(allErrs, field.Invalid(chldPath.Child("ports").Index(iy), newP, "(autoport) must not update name"))
++			}
++			if newP.Protocol != oldP.Protocol {
++				containerErrs = append(allErrs, field.Invalid(chldPath.Child("ports").Index(iy), newP, "(autoport) must not update protocol"))
++			}
++			if newP.HostIP != oldP.HostIP {
++				containerErrs = append(allErrs, field.Invalid(chldPath.Child("ports").Index(iy), newP, "(autoport) must not update host ip"))
++			}
++
++			// container port can be changed only if ishostnetwork and unassigned
++			if !isHostNetwork && newP.ContainerPort != oldP.ContainerPort {
++				containerErrs = append(allErrs, field.Invalid(chldPath.Child("ports").Index(iy).Child("containerPort"), newP.ContainerPort, "(autoport) must not update container port if hostnetwork is not set"))
++			} else if isHostNetwork && oldP.ContainerPort != 0 && newP.ContainerPort != oldP.ContainerPort {
++				containerErrs = append(allErrs, field.Invalid(chldPath.Child("ports").Index(iy).Child("containerPort"), newP.ContainerPort, "(autoport) must not update container port if already assigned"))
++			}
++
++			// host port can be changed only if unassigned
++			if oldP.HostPort != 0 && newP.HostPort != oldP.HostPort {
++				containerErrs = append(allErrs, field.Invalid(chldPath.Child("ports").Index(iy).Child("hostPort"), newP.HostPort, "(autoport) must not update host port if already assigned"))
++			} else if newP.HostPort != oldP.HostPort {
++				assignedPorts++
++			}
++		}
++		if len(containerErrs) > 0 {
++			allErrs = append(allErrs, containerErrs...)
++			continue
++		}
++
++		// check env
++		if assignedPorts == 0 {
++			if !apiequality.Semantic.DeepEqual(newC.Env, oldC.Env) {
++				allErrs = append(allErrs, field.Invalid(chldPath.Child("env"), newC.Env, "(autoport) must not modify EnvVars if no ports were assigned"))
++			}
++			continue
++		}
++
++		replacedEnvs, newEnvs := diffEnv(oldC.Env, newC.Env)
++		if len(replacedEnvs) > 0 {
++			allErrs = append(allErrs, field.Invalid(chldPath.Child("env"), newC.Env, "(autoport) must not delete or update old EnvVars"))
++			continue
++		}
++
++		valid := sets.NewString()
++		valid.Insert("PORT")
++		for i := 0; i < assignedPorts; i++ {
++			valid.Insert(fmt.Sprintf("PORT%d", i))
++		}
++		added := sets.NewString()
++		for _, e := range newEnvs {
++			added.Insert(e.Name)
++		}
++		if !valid.Equal(added) {
++			allErrs = append(allErrs, field.Invalid(chldPath.Child("env"), newC.Env, fmt.Sprintf("(autoport) new envs are invalid, expected %v but got %v", valid.List(), added.List())))
++		}
++	}
++
++	return allErrs
++}
++
++// diffEnv returns 2 slices, containing elements in oldEnv but not in newEnv and elements in newEnv but not in oldEnv respectively
++func diffEnv(oldEnv, newEnv []core.EnvVar) ([]core.EnvVar, []core.EnvVar) {
++	oldEnvMap := make(map[core.EnvVar]interface{}, len(oldEnv))
++	for _, e := range oldEnv {
++		oldEnvMap[e] = nil
++	}
++	newEnvMap := make(map[core.EnvVar]interface{}, len(newEnv))
++	for _, e := range newEnv {
++		newEnvMap[e] = nil
++	}
++
++	replacedEnvs := []core.EnvVar{}
++	addedEnvs := []core.EnvVar{}
++
++	for _, e := range oldEnv {
++		if _, ok := newEnvMap[e]; !ok {
++			replacedEnvs = append(replacedEnvs, e)
++		}
++	}
++	for _, e := range newEnv {
++		if _, ok := oldEnvMap[e]; !ok {
++			addedEnvs = append(addedEnvs, e)
++		}
++	}
++
++	return replacedEnvs, addedEnvs
++}
+diff --git a/pkg/apis/core/validation/validation_test.go b/pkg/apis/core/validation/validation_test.go
+index 72c77a31805..fe32ef44054 100644
+--- a/pkg/apis/core/validation/validation_test.go
++++ b/pkg/apis/core/validation/validation_test.go
+@@ -40,6 +40,7 @@ import (
+ 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+ 	"k8s.io/component-base/featuregate"
+ 	featuregatetesting "k8s.io/component-base/featuregate/testing"
++	utilpod "k8s.io/kubernetes/pkg/api/v1/pod"
+ 	"k8s.io/kubernetes/pkg/apis/core"
+ 	"k8s.io/kubernetes/pkg/capabilities"
+ 	"k8s.io/kubernetes/pkg/features"
+@@ -5198,14 +5199,14 @@ func TestValidatePorts(t *testing.T) {
+ 		{Name: "do-re-me", ContainerPort: 84, Protocol: "SCTP"},
+ 		{ContainerPort: 85, Protocol: "TCP"},
+ 	}
+-	if errs := validateContainerPorts(successCase, field.NewPath("field")); len(errs) != 0 {
++	if errs := validateContainerPorts(false, false, successCase, field.NewPath("field")); len(errs) != 0 {
+ 		t.Errorf("expected success: %v", errs)
+ 	}
+ 
+ 	nonCanonicalCase := []core.ContainerPort{
+ 		{ContainerPort: 80, Protocol: "TCP"},
+ 	}
+-	if errs := validateContainerPorts(nonCanonicalCase, field.NewPath("field")); len(errs) != 0 {
++	if errs := validateContainerPorts(false, false, nonCanonicalCase, field.NewPath("field")); len(errs) != 0 {
+ 		t.Errorf("expected success: %v", errs)
+ 	}
+ 
+@@ -5270,7 +5271,7 @@ func TestValidatePorts(t *testing.T) {
+ 		},
+ 	}
+ 	for k, v := range errorCases {
+-		errs := validateContainerPorts(v.P, field.NewPath("field"))
++		errs := validateContainerPorts(false, false, v.P, field.NewPath("field"))
+ 		if len(errs) == 0 {
+ 			t.Errorf("expected failure for %s", k)
+ 		}
+@@ -6622,7 +6623,7 @@ func TestValidateEphemeralContainers(t *testing.T) {
+ 			},
+ 		},
+ 	} {
+-		if errs := validateEphemeralContainers(ephemeralContainers, containers, initContainers, vols, field.NewPath("ephemeralContainers"), PodValidationOptions{}); len(errs) != 0 {
++		if errs := validateEphemeralContainers(false, ephemeralContainers, containers, initContainers, vols, field.NewPath("ephemeralContainers"), PodValidationOptions{}); len(errs) != 0 {
+ 			t.Errorf("expected success for '%s' but got errors: %v", title, errs)
+ 		}
+ 	}
+@@ -6822,7 +6823,7 @@ func TestValidateEphemeralContainers(t *testing.T) {
+ 	}
+ 
+ 	for _, tc := range tcs {
+-		errs := validateEphemeralContainers(tc.ephemeralContainers, containers, initContainers, vols, field.NewPath("ephemeralContainers"), PodValidationOptions{})
++		errs := validateEphemeralContainers(false, tc.ephemeralContainers, containers, initContainers, vols, field.NewPath("ephemeralContainers"), PodValidationOptions{})
+ 
+ 		if len(errs) == 0 {
+ 			t.Errorf("for test %q, expected error but received none", tc.title)
+@@ -7109,7 +7110,7 @@ func TestValidateContainers(t *testing.T) {
+ 		},
+ 		{Name: "abc-1234", Image: "image", ImagePullPolicy: "IfNotPresent", TerminationMessagePolicy: "File", SecurityContext: fakeValidSecurityContext(true)},
+ 	}
+-	if errs := validateContainers(successCase, false, volumeDevices, field.NewPath("field"), PodValidationOptions{}); len(errs) != 0 {
++	if errs := validateContainers(false, false, successCase, false, volumeDevices, field.NewPath("field"), PodValidationOptions{}); len(errs) != 0 {
+ 		t.Errorf("expected success: %v", errs)
+ 	}
+ 
+@@ -7363,7 +7364,7 @@ func TestValidateContainers(t *testing.T) {
+ 		},
+ 	}
+ 	for k, v := range errorCases {
+-		if errs := validateContainers(v, false, volumeDevices, field.NewPath("field"), PodValidationOptions{}); len(errs) == 0 {
++		if errs := validateContainers(false, false, v, false, volumeDevices, field.NewPath("field"), PodValidationOptions{}); len(errs) == 0 {
+ 			t.Errorf("expected failure for %s", k)
+ 		}
+ 	}
+@@ -7397,7 +7398,7 @@ func TestValidateInitContainers(t *testing.T) {
+ 			TerminationMessagePolicy: "File",
+ 		},
+ 	}
+-	if errs := validateContainers(successCase, true, volumeDevices, field.NewPath("field"), PodValidationOptions{}); len(errs) != 0 {
++	if errs := validateContainers(false, false, successCase, true, volumeDevices, field.NewPath("field"), PodValidationOptions{}); len(errs) != 0 {
+ 		t.Errorf("expected success: %v", errs)
+ 	}
+ 
+@@ -7423,7 +7424,7 @@ func TestValidateInitContainers(t *testing.T) {
+ 		},
+ 	}
+ 	for k, v := range errorCases {
+-		if errs := validateContainers(v, true, volumeDevices, field.NewPath("field"), PodValidationOptions{}); len(errs) == 0 {
++		if errs := validateContainers(false, false, v, true, volumeDevices, field.NewPath("field"), PodValidationOptions{}); len(errs) == 0 {
+ 			t.Errorf("expected failure for %s", k)
+ 		}
+ 	}
+@@ -20455,3 +20456,271 @@ func TestValidateAppArmorProfileFormat(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestValidatePodCreateForAutoport(t *testing.T) {
++	testCases := []struct {
++		name        string
++		expectError bool
++		pod         *core.Pod
++	}{
++		{
++			name:        "host network, container port 0, host port 0",
++			expectError: false,
++			pod: &core.Pod{
++				ObjectMeta: metav1.ObjectMeta{Name: "123", Namespace: "ns", Annotations: map[string]string{utilpod.PodAutoPortAnnotation: "1"}},
++				Spec: core.PodSpec{
++					RestartPolicy:   core.RestartPolicyAlways,
++					DNSPolicy:       core.DNSClusterFirst,
++					SecurityContext: &core.PodSecurityContext{HostNetwork: true},
++					Containers: []core.Container{
++						{
++							Name:                     "ctr",
++							Image:                    "image",
++							ImagePullPolicy:          "IfNotPresent",
++							TerminationMessagePolicy: "File",
++							Ports: []core.ContainerPort{
++								{
++									Name:          "port",
++									ContainerPort: 0,
++									HostPort:      0,
++									Protocol:      core.ProtocolTCP,
++								},
++							},
++						},
++					},
++				},
++			},
++		},
++		{
++			name:        "host network, container port 0, host port not 0",
++			expectError: true,
++			pod: &core.Pod{
++				ObjectMeta: metav1.ObjectMeta{Name: "123", Namespace: "ns", Annotations: map[string]string{utilpod.PodAutoPortAnnotation: "1"}},
++				Spec: core.PodSpec{
++					RestartPolicy:   core.RestartPolicyAlways,
++					DNSPolicy:       core.DNSClusterFirst,
++					SecurityContext: &core.PodSecurityContext{HostNetwork: true},
++					Containers: []core.Container{
++						{
++							Name:                     "ctr",
++							Image:                    "image",
++							ImagePullPolicy:          "IfNotPresent",
++							TerminationMessagePolicy: "File",
++							Ports: []core.ContainerPort{
++								{
++									Name:          "port",
++									ContainerPort: 0,
++									HostPort:      8080,
++									Protocol:      core.ProtocolTCP,
++								},
++							},
++						},
++					},
++				},
++			},
++		},
++		{
++			name:        "host network, container port not 0, host port 0",
++			expectError: true,
++			pod: &core.Pod{
++				ObjectMeta: metav1.ObjectMeta{Name: "123", Namespace: "ns", Annotations: map[string]string{utilpod.PodAutoPortAnnotation: "1"}},
++				Spec: core.PodSpec{
++					RestartPolicy:   core.RestartPolicyAlways,
++					DNSPolicy:       core.DNSClusterFirst,
++					SecurityContext: &core.PodSecurityContext{HostNetwork: true},
++					Containers: []core.Container{
++						{
++							Name:                     "ctr",
++							Image:                    "image",
++							ImagePullPolicy:          "IfNotPresent",
++							TerminationMessagePolicy: "File",
++							Ports: []core.ContainerPort{
++								{
++									Name:          "port",
++									ContainerPort: 8080,
++									HostPort:      0,
++									Protocol:      core.ProtocolTCP,
++								},
++							},
++						},
++					},
++				},
++			},
++		},
++		{
++			name:        "host network, container port not 0, host port not 0, container port = host port",
++			expectError: false,
++			pod: &core.Pod{
++				ObjectMeta: metav1.ObjectMeta{Name: "123", Namespace: "ns", Annotations: map[string]string{utilpod.PodAutoPortAnnotation: "1"}},
++				Spec: core.PodSpec{
++					RestartPolicy:   core.RestartPolicyAlways,
++					DNSPolicy:       core.DNSClusterFirst,
++					SecurityContext: &core.PodSecurityContext{HostNetwork: true},
++					Containers: []core.Container{
++						{
++							Name:                     "ctr",
++							Image:                    "image",
++							ImagePullPolicy:          "IfNotPresent",
++							TerminationMessagePolicy: "File",
++							Ports: []core.ContainerPort{
++								{
++									Name:          "port",
++									ContainerPort: 8080,
++									HostPort:      8080,
++									Protocol:      core.ProtocolTCP,
++								},
++							},
++						},
++					},
++				},
++			},
++		},
++		{
++			name:        "host network, container port not 0, host port not 0, container port != host port",
++			expectError: true,
++			pod: &core.Pod{
++				ObjectMeta: metav1.ObjectMeta{Name: "123", Namespace: "ns", Annotations: map[string]string{utilpod.PodAutoPortAnnotation: "1"}},
++				Spec: core.PodSpec{
++					RestartPolicy:   core.RestartPolicyAlways,
++					DNSPolicy:       core.DNSClusterFirst,
++					SecurityContext: &core.PodSecurityContext{HostNetwork: true},
++					Containers: []core.Container{
++						{
++							Name:                     "ctr",
++							Image:                    "image",
++							ImagePullPolicy:          "IfNotPresent",
++							TerminationMessagePolicy: "File",
++							Ports: []core.ContainerPort{
++								{
++									Name:          "port",
++									ContainerPort: 8080,
++									HostPort:      8081,
++									Protocol:      core.ProtocolTCP,
++								},
++							},
++						},
++					},
++				},
++			},
++		},
++		{
++			name:        "no host network, container port 0, host port 0",
++			expectError: true,
++			pod: &core.Pod{
++				ObjectMeta: metav1.ObjectMeta{Name: "123", Namespace: "ns", Annotations: map[string]string{utilpod.PodAutoPortAnnotation: "1"}},
++				Spec: core.PodSpec{
++					RestartPolicy: core.RestartPolicyAlways,
++					DNSPolicy:     core.DNSClusterFirst,
++					Containers: []core.Container{
++						{
++							Name:                     "ctr",
++							Image:                    "image",
++							ImagePullPolicy:          "IfNotPresent",
++							TerminationMessagePolicy: "File",
++							Ports: []core.ContainerPort{
++								{
++									Name:          "port",
++									ContainerPort: 0,
++									HostPort:      0,
++									Protocol:      core.ProtocolTCP,
++								},
++							},
++						},
++					},
++				},
++			},
++		},
++		{
++			name:        "no host network, container port 0, host port not 0",
++			expectError: true,
++			pod: &core.Pod{
++				ObjectMeta: metav1.ObjectMeta{Name: "123", Namespace: "ns", Annotations: map[string]string{utilpod.PodAutoPortAnnotation: "1"}},
++				Spec: core.PodSpec{
++					RestartPolicy: core.RestartPolicyAlways,
++					DNSPolicy:     core.DNSClusterFirst,
++					Containers: []core.Container{
++						{
++							Name:                     "ctr",
++							Image:                    "image",
++							ImagePullPolicy:          "IfNotPresent",
++							TerminationMessagePolicy: "File",
++							Ports: []core.ContainerPort{
++								{
++									Name:          "port",
++									ContainerPort: 0,
++									HostPort:      8080,
++									Protocol:      core.ProtocolTCP,
++								},
++							},
++						},
++					},
++				},
++			},
++		},
++		{
++			name:        "no host network, container port not 0, host port 0",
++			expectError: false,
++			pod: &core.Pod{
++				ObjectMeta: metav1.ObjectMeta{Name: "123", Namespace: "ns", Annotations: map[string]string{utilpod.PodAutoPortAnnotation: "1"}},
++				Spec: core.PodSpec{
++					RestartPolicy: core.RestartPolicyAlways,
++					DNSPolicy:     core.DNSClusterFirst,
++					Containers: []core.Container{
++						{
++							Name:                     "ctr",
++							Image:                    "image",
++							ImagePullPolicy:          "IfNotPresent",
++							TerminationMessagePolicy: "File",
++							Ports: []core.ContainerPort{
++								{
++									Name:          "port",
++									ContainerPort: 8080,
++									HostPort:      0,
++									Protocol:      core.ProtocolTCP,
++								},
++							},
++						},
++					},
++				},
++			},
++		},
++		{
++			name:        "no host network, container port not 0, host port not 0",
++			expectError: false,
++			pod: &core.Pod{
++				ObjectMeta: metav1.ObjectMeta{Name: "123", Namespace: "ns", Annotations: map[string]string{utilpod.PodAutoPortAnnotation: "1"}},
++				Spec: core.PodSpec{
++					RestartPolicy: core.RestartPolicyAlways,
++					DNSPolicy:     core.DNSClusterFirst,
++					Containers: []core.Container{
++						{
++							Name:                     "ctr",
++							Image:                    "image",
++							ImagePullPolicy:          "IfNotPresent",
++							TerminationMessagePolicy: "File",
++							Ports: []core.ContainerPort{
++								{
++									Name:          "port",
++									ContainerPort: 8081,
++									HostPort:      8080,
++									Protocol:      core.ProtocolTCP,
++								},
++							},
++						},
++					},
++				},
++			},
++		},
++	}
++	for _, testCase := range testCases {
++		t.Run(testCase.name, func(t *testing.T) {
++			errs := ValidatePodCreate(testCase.pod, PodValidationOptions{})
++			if testCase.expectError && len(errs) == 0 {
++				t.Errorf("Unexpected success")
++			}
++			if !testCase.expectError && len(errs) != 0 {
++				t.Errorf("Unexpected error(s): %v", errs)
++			}
++		})
++	}
++}
+diff --git a/pkg/generated/openapi/zz_generated.openapi.go b/pkg/generated/openapi/zz_generated.openapi.go
+index 87ce880c935..b434c316009 100644
+--- a/pkg/generated/openapi/zz_generated.openapi.go
++++ b/pkg/generated/openapi/zz_generated.openapi.go
+@@ -53452,11 +53452,18 @@ func schema_k8sio_kubelet_config_v1beta1_KubeletConfiguration(ref common.Referen
+ 							Format:      "",
+ 						},
+ 					},
++					"hostPortRange": {
++						SchemaProps: spec.SchemaProps{
++							Description: "HostPortRange specifies the port range reserved for port assignment of autoport pod.",
++							Default:     map[string]interface{}{},
++							Ref:         ref("k8s.io/apimachinery/pkg/util/net.PortRange"),
++						},
++					},
+ 				},
+ 			},
+ 		},
+ 		Dependencies: []string{
+-			"k8s.io/api/core/v1.Taint", "k8s.io/apimachinery/pkg/apis/meta/v1.Duration", "k8s.io/component-base/config/v1alpha1.LoggingConfiguration", "k8s.io/kubelet/config/v1beta1.KubeletAuthentication", "k8s.io/kubelet/config/v1beta1.KubeletAuthorization", "k8s.io/kubelet/config/v1beta1.MemoryReservation", "k8s.io/kubelet/config/v1beta1.MemorySwapConfiguration", "k8s.io/kubelet/config/v1beta1.ShutdownGracePeriodByPodPriority"},
++			"k8s.io/api/core/v1.Taint", "k8s.io/apimachinery/pkg/apis/meta/v1.Duration", "k8s.io/apimachinery/pkg/util/net.PortRange", "k8s.io/component-base/config/v1alpha1.LoggingConfiguration", "k8s.io/kubelet/config/v1beta1.KubeletAuthentication", "k8s.io/kubelet/config/v1beta1.KubeletAuthorization", "k8s.io/kubelet/config/v1beta1.MemoryReservation", "k8s.io/kubelet/config/v1beta1.MemorySwapConfiguration", "k8s.io/kubelet/config/v1beta1.ShutdownGracePeriodByPodPriority"},
+ 	}
+ }
+ 
+diff --git a/pkg/kubelet/apis/config/helpers_test.go b/pkg/kubelet/apis/config/helpers_test.go
+index a0e5e6b38d9..36248e3e369 100644
+--- a/pkg/kubelet/apis/config/helpers_test.go
++++ b/pkg/kubelet/apis/config/helpers_test.go
+@@ -206,6 +206,8 @@ var (
+ 		"FileCheckFrequency.Duration",
+ 		"HTTPCheckFrequency.Duration",
+ 		"HairpinMode",
++		"HostPortRange.Base",
++		"HostPortRange.Size",
+ 		"HealthzBindAddress",
+ 		"HealthzPort",
+ 		"Logging.FlushFrequency",
+diff --git a/pkg/kubelet/apis/config/scheme/testdata/KubeletConfiguration/after/v1beta1.yaml b/pkg/kubelet/apis/config/scheme/testdata/KubeletConfiguration/after/v1beta1.yaml
+index 3cb76b89923..e67fe5cb0ef 100644
+--- a/pkg/kubelet/apis/config/scheme/testdata/KubeletConfiguration/after/v1beta1.yaml
++++ b/pkg/kubelet/apis/config/scheme/testdata/KubeletConfiguration/after/v1beta1.yaml
+@@ -43,6 +43,9 @@ fileCheckFrequency: 20s
+ hairpinMode: promiscuous-bridge
+ healthzBindAddress: 127.0.0.1
+ healthzPort: 10248
++hostPortRange:
++  Base: 9200
++  Size: 301
+ httpCheckFrequency: 20s
+ imageGCHighThresholdPercent: 85
+ imageGCLowThresholdPercent: 80
+diff --git a/pkg/kubelet/apis/config/scheme/testdata/KubeletConfiguration/roundtrip/default/v1beta1.yaml b/pkg/kubelet/apis/config/scheme/testdata/KubeletConfiguration/roundtrip/default/v1beta1.yaml
+index 3cb76b89923..e67fe5cb0ef 100644
+--- a/pkg/kubelet/apis/config/scheme/testdata/KubeletConfiguration/roundtrip/default/v1beta1.yaml
++++ b/pkg/kubelet/apis/config/scheme/testdata/KubeletConfiguration/roundtrip/default/v1beta1.yaml
+@@ -43,6 +43,9 @@ fileCheckFrequency: 20s
+ hairpinMode: promiscuous-bridge
+ healthzBindAddress: 127.0.0.1
+ healthzPort: 10248
++hostPortRange:
++  Base: 9200
++  Size: 301
+ httpCheckFrequency: 20s
+ imageGCHighThresholdPercent: 85
+ imageGCLowThresholdPercent: 80
+diff --git a/pkg/kubelet/apis/config/types.go b/pkg/kubelet/apis/config/types.go
+index c586b0cf6d1..80f317fae58 100644
+--- a/pkg/kubelet/apis/config/types.go
++++ b/pkg/kubelet/apis/config/types.go
+@@ -19,6 +19,7 @@ package config
+ import (
+ 	v1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	netutil "k8s.io/apimachinery/pkg/util/net"
+ 	componentbaseconfig "k8s.io/component-base/config"
+ )
+ 
+@@ -445,6 +446,11 @@ type KubeletConfiguration struct {
+ 	// registerNode enables automatic registration with the apiserver.
+ 	// +optional
+ 	RegisterNode bool
++
++	// HostPortRange spcifies the port range reserved for port assignment of autoport pod
++	// Default: 9200-9500
++	// +optional
++	HostPortRange netutil.PortRange
+ }
+ 
+ // KubeletAuthorizationMode denotes the authorization mode for the kubelet
+diff --git a/pkg/kubelet/apis/config/v1beta1/defaults.go b/pkg/kubelet/apis/config/v1beta1/defaults.go
+index eee1d0945da..cbcdff636d2 100644
+--- a/pkg/kubelet/apis/config/v1beta1/defaults.go
++++ b/pkg/kubelet/apis/config/v1beta1/defaults.go
+@@ -21,6 +21,7 @@ import (
+ 
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	kruntime "k8s.io/apimachinery/pkg/runtime"
++	utilnet "k8s.io/apimachinery/pkg/util/net"
+ 	componentbaseconfigv1alpha1 "k8s.io/component-base/config/v1alpha1"
+ 	kubeletconfigv1beta1 "k8s.io/kubelet/config/v1beta1"
+ 
+@@ -42,7 +43,8 @@ const (
+ )
+ 
+ var (
+-	zeroDuration = metav1.Duration{}
++	zeroDuration  = metav1.Duration{}
++	zeroPortRange = utilnet.PortRange{}
+ 	// TODO: Move these constants to k8s.io/kubelet/config/v1beta1 instead?
+ 	// Refer to [Node Allocatable](https://git.k8s.io/community/contributors/design-proposals/node/node-allocatable.md) doc for more information.
+ 	DefaultNodeAllocatableEnforcement = []string{"pods"}
+@@ -264,4 +266,7 @@ func SetDefaults_KubeletConfiguration(obj *kubeletconfigv1beta1.KubeletConfigura
+ 	if obj.RegisterNode == nil {
+ 		obj.RegisterNode = utilpointer.BoolPtr(true)
+ 	}
++	if obj.HostPortRange == zeroPortRange {
++		obj.HostPortRange = utilnet.PortRange{Base: 9200, Size: 301}
++	}
+ }
+diff --git a/pkg/kubelet/apis/config/v1beta1/defaults_test.go b/pkg/kubelet/apis/config/v1beta1/defaults_test.go
+index aa835bd9811..522e69a12b7 100644
+--- a/pkg/kubelet/apis/config/v1beta1/defaults_test.go
++++ b/pkg/kubelet/apis/config/v1beta1/defaults_test.go
+@@ -24,6 +24,7 @@ import (
+ 	v1 "k8s.io/api/core/v1"
+ 	"k8s.io/apimachinery/pkg/api/resource"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	utilnet "k8s.io/apimachinery/pkg/util/net"
+ 	componentbaseconfigv1alpha1 "k8s.io/component-base/config/v1alpha1"
+ 	"k8s.io/kubelet/config/v1beta1"
+ 	"k8s.io/kubernetes/pkg/cluster/ports"
+@@ -121,6 +122,7 @@ func TestSetDefaultsKubeletConfiguration(t *testing.T) {
+ 				SeccompDefault:          utilpointer.BoolPtr(false),
+ 				MemoryThrottlingFactor:  utilpointer.Float64Ptr(DefaultMemoryThrottlingFactor),
+ 				RegisterNode:            utilpointer.BoolPtr(true),
++				HostPortRange:           utilnet.PortRange{Base: 9200, Size: 301},
+ 			},
+ 		},
+ 		{
+@@ -340,6 +342,7 @@ func TestSetDefaultsKubeletConfiguration(t *testing.T) {
+ 				SeccompDefault:          utilpointer.Bool(false),
+ 				MemoryThrottlingFactor:  utilpointer.Float64(0),
+ 				RegisterNode:            utilpointer.BoolPtr(false),
++				HostPortRange:           utilnet.PortRange{Base: 9200, Size: 301},
+ 			},
+ 		},
+ 		{
+@@ -629,6 +632,7 @@ func TestSetDefaultsKubeletConfiguration(t *testing.T) {
+ 				SeccompDefault:          utilpointer.Bool(true),
+ 				MemoryThrottlingFactor:  utilpointer.Float64(1),
+ 				RegisterNode:            utilpointer.BoolPtr(true),
++				HostPortRange:           utilnet.PortRange{Base: 9200, Size: 301},
+ 			},
+ 		},
+ 		{
+@@ -715,6 +719,7 @@ func TestSetDefaultsKubeletConfiguration(t *testing.T) {
+ 				SeccompDefault:          utilpointer.BoolPtr(false),
+ 				MemoryThrottlingFactor:  utilpointer.Float64Ptr(DefaultMemoryThrottlingFactor),
+ 				RegisterNode:            utilpointer.BoolPtr(true),
++				HostPortRange:           utilnet.PortRange{Base: 9200, Size: 301},
+ 			},
+ 		},
+ 	}
+diff --git a/pkg/kubelet/apis/config/v1beta1/zz_generated.conversion.go b/pkg/kubelet/apis/config/v1beta1/zz_generated.conversion.go
+index 5cc1efddcd7..fa65f413e38 100644
+--- a/pkg/kubelet/apis/config/v1beta1/zz_generated.conversion.go
++++ b/pkg/kubelet/apis/config/v1beta1/zz_generated.conversion.go
+@@ -509,6 +509,7 @@ func autoConvert_v1beta1_KubeletConfiguration_To_config_KubeletConfiguration(in
+ 	if err := v1.Convert_Pointer_bool_To_bool(&in.RegisterNode, &out.RegisterNode, s); err != nil {
+ 		return err
+ 	}
++	out.HostPortRange = in.HostPortRange
+ 	return nil
+ }
+ 
+@@ -685,6 +686,7 @@ func autoConvert_config_KubeletConfiguration_To_v1beta1_KubeletConfiguration(in
+ 	if err := v1.Convert_bool_To_Pointer_bool(&in.RegisterNode, &out.RegisterNode, s); err != nil {
+ 		return err
+ 	}
++	out.HostPortRange = in.HostPortRange
+ 	return nil
+ }
+ 
+diff --git a/pkg/kubelet/apis/config/zz_generated.deepcopy.go b/pkg/kubelet/apis/config/zz_generated.deepcopy.go
+index 99c3c339335..78c79a3f018 100644
+--- a/pkg/kubelet/apis/config/zz_generated.deepcopy.go
++++ b/pkg/kubelet/apis/config/zz_generated.deepcopy.go
+@@ -307,6 +307,7 @@ func (in *KubeletConfiguration) DeepCopyInto(out *KubeletConfiguration) {
+ 			(*in)[i].DeepCopyInto(&(*out)[i])
+ 		}
+ 	}
++	out.HostPortRange = in.HostPortRange
+ 	return
+ }
+ 
+diff --git a/pkg/kubelet/dynamicpodspec/ports.go b/pkg/kubelet/dynamicpodspec/ports.go
+new file mode 100644
+index 00000000000..c693896e454
+--- /dev/null
++++ b/pkg/kubelet/dynamicpodspec/ports.go
+@@ -0,0 +1,218 @@
++package dynamicpodspec
++
++import (
++	"context"
++	"fmt"
++	"time"
++
++	v1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	netutil "k8s.io/apimachinery/pkg/util/net"
++	clientset "k8s.io/client-go/kubernetes"
++	"k8s.io/client-go/util/retry"
++	"k8s.io/klog/v2"
++	"k8s.io/kubernetes/pkg/kubelet/lifecycle"
++)
++
++type assignPortAdmitHandler struct {
++	podAnnotation string
++	portRange     netutil.PortRange
++	client        clientset.Interface
++}
++
++func NewAssignPortHandler(podAnnotation string, portRange netutil.PortRange, client clientset.Interface) *assignPortAdmitHandler {
++	return &assignPortAdmitHandler{
++		podAnnotation: podAnnotation,
++		portRange:     portRange,
++		client:        client,
++	}
++}
++
++func (w *assignPortAdmitHandler) Admit(attrs *lifecycle.PodAdmitAttributes) lifecycle.PodAdmitResult {
++	pod := attrs.Pod
++
++	_, isAutoport := pod.ObjectMeta.Annotations[w.podAnnotation]
++	if !isAutoport {
++		return lifecycle.PodAdmitResult{
++			Admit: true,
++		}
++	}
++
++	numPortsToAllocate := countPortsToAllocate(pod)
++	if numPortsToAllocate == 0 {
++		return lifecycle.PodAdmitResult{
++			Admit: true,
++		}
++	}
++
++	// we use `lastUsedPort` as a heuristic to speed up or search
++	allocatedPorts, lastUsedPort := getUsedPorts(attrs.OtherPods...)
++	allocation := w.allocatePorts(allocatedPorts, lastUsedPort+1, numPortsToAllocate)
++	if len(allocation) == 0 {
++		klog.V(1).Infof("no enough hostport can be assigned for pod %v", pod.Name)
++		return lifecycle.PodAdmitResult{
++			Admit:   false,
++			Reason:  "OutOfHostPort",
++			Message: "Host port is exhausted.",
++		}
++	}
++	// fill port info into pod related fields
++	updatePodWithAllocation(allocation, pod)
++
++	klog.V(2).Infof("%s/%s updating %d ports with allocation %v", pod.Namespace, pod.Name, numPortsToAllocate, allocation)
++	if err := retry.RetryOnConflict(retry.DefaultRetry, func() (err error) {
++		_, updateErr := w.client.CoreV1().Pods(pod.Namespace).Update(context.Background(), pod, metav1.UpdateOptions{})
++		if updateErr == nil {
++			return nil
++		}
++
++		if updated, err := w.client.CoreV1().Pods(pod.Namespace).Get(context.Background(), pod.Name, metav1.GetOptions{}); err == nil {
++			if pod.GetUID() != updated.GetUID() {
++				return fmt.Errorf("pod was deleted and then recreated, skipping pod update: oldPodUID %s, newPodUID %s", pod.GetUID(), updated.GetUID())
++			}
++			updatePodWithAllocation(allocation, updated)
++			updated.DeepCopyInto(pod)
++		}
++		return updateErr
++	}); err != nil {
++		klog.Errorf("failed to update pod: %s/%s %v", attrs.Pod.Namespace, attrs.Pod.Name, err)
++		return lifecycle.PodAdmitResult{
++			Admit:   false,
++			Reason:  "FailedUpdate",
++			Message: fmt.Sprintf("Update pod failed. %v", err),
++		}
++
++	}
++
++	return lifecycle.PodAdmitResult{
++		Admit: true,
++	}
++}
++
++func (w *assignPortAdmitHandler) allocatePorts(allocated map[int]bool, start, request int) []int {
++	if request > w.portRange.Size {
++		return nil
++	}
++
++	if start < w.portRange.Base || start >= w.portRange.Base+w.portRange.Size {
++		start = w.portRange.Base
++	}
++
++	numAllocated := 0
++	allocation := make([]int, request)
++
++	// we start our search from `start` and loop through the port range
++	for i := 0; i < w.portRange.Size; i++ {
++		if numAllocated >= request {
++			break
++		}
++
++		offset := (start + i - w.portRange.Base) % w.portRange.Size
++		curPort := w.portRange.Base + offset
++
++		if !allocated[curPort] {
++			allocation[numAllocated] = curPort
++			numAllocated++
++		}
++	}
++
++	if numAllocated < request {
++		return nil
++	}
++
++	return allocation
++}
++
++// countPortsToAllocate returns number of ports to be allocated for this pod
++func countPortsToAllocate(pod *v1.Pod) int {
++	count := 0
++	for i := range pod.Spec.Containers {
++		for j := range pod.Spec.Containers[i].Ports {
++			if pod.Spec.Containers[i].Ports[j].HostPort == 0 {
++				count++
++			}
++		}
++	}
++	return count
++}
++
++// getScheduledTime returns scheduled time of the pod
++func getScheduledTime(pod *v1.Pod) time.Time {
++	for _, condition := range pod.Status.Conditions {
++		if condition.Type == v1.PodScheduled {
++			if condition.Status == v1.ConditionTrue {
++				return condition.LastTransitionTime.Time
++			}
++		}
++	}
++	return time.Time{}
++}
++
++// getUsedPorts aggregates the already allocated ports from admited pods
++func getUsedPorts(pods ...*v1.Pod) (map[int]bool, int) {
++	ports := make(map[int]bool)
++	lastPort := 0
++	var lastPodTime time.Time
++
++	for _, pod := range pods {
++		scheduledTime := getScheduledTime(pod)
++
++		for _, container := range pod.Spec.Containers {
++			for _, port := range container.Ports {
++				if port.HostPort != 0 {
++					ports[int(port.HostPort)] = true
++
++					if scheduledTime.After(lastPodTime) {
++						lastPodTime = scheduledTime
++						lastPort = int(port.HostPort)
++					}
++				}
++			}
++		}
++
++	}
++
++	return ports, lastPort
++}
++
++// updatePodWithAllocation update pod spec with allocated ports info
++// it will modify 2 places:
++// 1. container port
++// 2. container env
++func updatePodWithAllocation(allocation []int, pod *v1.Pod) {
++	allocationIdx := 0
++
++	for i := range pod.Spec.Containers {
++		containerNumAllocated := 0
++
++		for j := range pod.Spec.Containers[i].Ports {
++			if allocationIdx >= len(allocation) {
++				return
++			}
++			if pod.Spec.Containers[i].Ports[j].HostPort != 0 {
++				continue
++			}
++
++			port := allocation[allocationIdx]
++			pod.Spec.Containers[i].Ports[j].HostPort = int32(port)
++			if pod.Spec.HostNetwork {
++				pod.Spec.Containers[i].Ports[j].ContainerPort = int32(port)
++			}
++
++			portEnv := v1.EnvVar{
++				Name:  fmt.Sprintf("PORT%d", containerNumAllocated),
++				Value: fmt.Sprintf("%d", port),
++			}
++			pod.Spec.Containers[i].Env = append(pod.Spec.Containers[i].Env, portEnv)
++			if containerNumAllocated == 0 {
++				pod.Spec.Containers[i].Env = append(pod.Spec.Containers[i].Env, v1.EnvVar{
++					Name:  "PORT",
++					Value: fmt.Sprintf("%d", port),
++				})
++			}
++
++			containerNumAllocated++
++			allocationIdx++
++		}
++	}
++}
+diff --git a/pkg/kubelet/kubelet.go b/pkg/kubelet/kubelet.go
+index 3e753c93bc2..fdca83706ea 100644
+--- a/pkg/kubelet/kubelet.go
++++ b/pkg/kubelet/kubelet.go
+@@ -46,6 +46,7 @@ import (
+ 	"k8s.io/apimachinery/pkg/fields"
+ 	"k8s.io/apimachinery/pkg/labels"
+ 	"k8s.io/apimachinery/pkg/types"
++	netutil "k8s.io/apimachinery/pkg/util/net"
+ 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+ 	"k8s.io/apimachinery/pkg/util/sets"
+ 	"k8s.io/apimachinery/pkg/util/wait"
+@@ -63,6 +64,7 @@ import (
+ 	"k8s.io/klog/v2"
+ 	pluginwatcherapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
+ 	statsapi "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
++	utilpod "k8s.io/kubernetes/pkg/api/v1/pod"
+ 	"k8s.io/kubernetes/pkg/features"
+ 	kubeletconfiginternal "k8s.io/kubernetes/pkg/kubelet/apis/config"
+ 	"k8s.io/kubernetes/pkg/kubelet/apis/podresources"
+@@ -74,6 +76,7 @@ import (
+ 	"k8s.io/kubernetes/pkg/kubelet/configmap"
+ 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
+ 	"k8s.io/kubernetes/pkg/kubelet/cri/remote"
++	dynamic "k8s.io/kubernetes/pkg/kubelet/dynamicpodspec"
+ 	"k8s.io/kubernetes/pkg/kubelet/events"
+ 	"k8s.io/kubernetes/pkg/kubelet/eviction"
+ 	"k8s.io/kubernetes/pkg/kubelet/images"
+@@ -524,6 +527,7 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
+ 		keepTerminatedPodVolumes:                keepTerminatedPodVolumes,
+ 		nodeStatusMaxImages:                     nodeStatusMaxImages,
+ 		lastContainerStartedTime:                newTimeCache(),
++		hostPortRange:                           kubeCfg.HostPortRange,
+ 	}
+ 
+ 	if klet.cloud != nil {
+@@ -795,6 +799,10 @@ func NewMainKubelet(kubeCfg *kubeletconfiginternal.KubeletConfiguration,
+ 
+ 	criticalPodAdmissionHandler := preemption.NewCriticalPodAdmissionHandler(klet.GetActivePods, killPodNow(klet.podWorkers, kubeDeps.Recorder), kubeDeps.Recorder)
+ 	klet.admitHandlers.AddPodAdmitHandler(lifecycle.NewPredicateAdmitHandler(klet.getNodeAnyWay, criticalPodAdmissionHandler, klet.containerManager.UpdatePluginResources))
++
++	assignPort := dynamic.NewAssignPortHandler(utilpod.PodAutoPortAnnotation, klet.hostPortRange, klet.kubeClient)
++	klet.admitHandlers.AddPodAdmitHandler(assignPort)
++
+ 	// apply functional Option's
+ 	for _, opt := range kubeDeps.Options {
+ 		opt(klet)
+@@ -1162,6 +1170,9 @@ type Kubelet struct {
+ 	// plugins need to be registered/unregistered based on this node and makes it so.
+ 	pluginManager pluginmanager.PluginManager
+ 
++	// hostPortRange specifies the port range reserved for port assignment of autoport pod
++	hostPortRange netutil.PortRange
++
+ 	// This flag sets a maximum number of images to report in the node status.
+ 	nodeStatusMaxImages int32
+ 
+diff --git a/plugin/pkg/admission/noderestriction/admission.go b/plugin/pkg/admission/noderestriction/admission.go
+index ee12bce0c26..bf665998d96 100644
+--- a/plugin/pkg/admission/noderestriction/admission.go
++++ b/plugin/pkg/admission/noderestriction/admission.go
+@@ -175,7 +175,7 @@ func (p *Plugin) admitPod(nodeName string, a admission.Attributes) error {
+ 	case admission.Create:
+ 		return p.admitPodCreate(nodeName, a)
+ 
+-	case admission.Delete:
++	case admission.Delete, admission.Update:
+ 		// get the existing pod
+ 		existingPod, err := p.podsGetter.Pods(a.GetNamespace()).Get(a.GetName())
+ 		if errors.IsNotFound(err) {
+diff --git a/plugin/pkg/auth/authorizer/rbac/bootstrappolicy/policy.go b/plugin/pkg/auth/authorizer/rbac/bootstrappolicy/policy.go
+index 0c700521483..ad3a6908591 100644
+--- a/plugin/pkg/auth/authorizer/rbac/bootstrappolicy/policy.go
++++ b/plugin/pkg/auth/authorizer/rbac/bootstrappolicy/policy.go
+@@ -124,8 +124,9 @@ func NodeRules() []rbacv1.PolicyRule {
+ 		rbacv1helpers.NewRule(Read...).Groups(legacyGroup).Resources("pods").RuleOrDie(),
+ 
+ 		// Needed for the node to create/delete mirror pods.
++		// Needed for the node to update the pod spec when using the autoport feature.
+ 		// Use the NodeRestriction admission plugin to limit a node to creating/deleting mirror pods bound to itself.
+-		rbacv1helpers.NewRule("create", "delete").Groups(legacyGroup).Resources("pods").RuleOrDie(),
++		rbacv1helpers.NewRule("create", "delete", "update").Groups(legacyGroup).Resources("pods").RuleOrDie(),
+ 		// Needed for the node to report status of pods it is running.
+ 		// Use the NodeRestriction admission plugin to limit a node to updating status of pods bound to itself.
+ 		rbacv1helpers.NewRule("update", "patch").Groups(legacyGroup).Resources("pods/status").RuleOrDie(),
+diff --git a/staging/src/k8s.io/kubelet/config/v1beta1/types.go b/staging/src/k8s.io/kubelet/config/v1beta1/types.go
+index ef3f33ca644..2b397b9d34c 100644
+--- a/staging/src/k8s.io/kubelet/config/v1beta1/types.go
++++ b/staging/src/k8s.io/kubelet/config/v1beta1/types.go
+@@ -19,6 +19,7 @@ package v1beta1
+ import (
+ 	v1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	utilnet "k8s.io/apimachinery/pkg/util/net"
+ 	componentbaseconfigv1alpha1 "k8s.io/component-base/config/v1alpha1"
+ )
+ 
+@@ -780,6 +781,10 @@ type KubeletConfiguration struct {
+ 	// Default: true
+ 	// +optional
+ 	RegisterNode *bool `json:"registerNode,omitempty"`
++	// HostPortRange specifies the port range reserved for port assignment of autoport pod.
++	// Default: 9200-9500
++	// +optional
++	HostPortRange utilnet.PortRange `json:"hostPortRange,omitempty"`
+ }
+ 
+ type KubeletAuthorizationMode string
+diff --git a/staging/src/k8s.io/kubelet/config/v1beta1/zz_generated.deepcopy.go b/staging/src/k8s.io/kubelet/config/v1beta1/zz_generated.deepcopy.go
+index ccb8fbbafbd..0468c25e051 100644
+--- a/staging/src/k8s.io/kubelet/config/v1beta1/zz_generated.deepcopy.go
++++ b/staging/src/k8s.io/kubelet/config/v1beta1/zz_generated.deepcopy.go
+@@ -446,6 +446,7 @@ func (in *KubeletConfiguration) DeepCopyInto(out *KubeletConfiguration) {
+ 		*out = new(bool)
+ 		**out = **in
+ 	}
++	out.HostPortRange = in.HostPortRange
+ 	return
+ }
+ 
+diff --git a/test/e2e/e2e_test.go b/test/e2e/e2e_test.go
+index 2bd2af0a781..93cb2749ba6 100644
+--- a/test/e2e/e2e_test.go
++++ b/test/e2e/e2e_test.go
+@@ -51,6 +51,7 @@ import (
+ 	_ "k8s.io/kubernetes/test/e2e/common"
+ 	_ "k8s.io/kubernetes/test/e2e/instrumentation"
+ 	_ "k8s.io/kubernetes/test/e2e/kubectl"
++	_ "k8s.io/kubernetes/test/e2e/kubewharf"
+ 	_ "k8s.io/kubernetes/test/e2e/lifecycle"
+ 	_ "k8s.io/kubernetes/test/e2e/lifecycle/bootstrap"
+ 	_ "k8s.io/kubernetes/test/e2e/network"
+diff --git a/test/e2e/kubewharf/OWNERS b/test/e2e/kubewharf/OWNERS
+new file mode 100644
+index 00000000000..e69de29bb2d
+diff --git a/test/e2e/kubewharf/autoport.go b/test/e2e/kubewharf/autoport.go
+new file mode 100644
+index 00000000000..55f1007f535
+--- /dev/null
++++ b/test/e2e/kubewharf/autoport.go
+@@ -0,0 +1,244 @@
++package kubewharf
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"math/rand"
++	"strconv"
++	"time"
++
++	"github.com/onsi/ginkgo"
++
++	corev1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/util/sets"
++	"k8s.io/apimachinery/pkg/util/uuid"
++	"k8s.io/apimachinery/pkg/util/wait"
++	clientset "k8s.io/client-go/kubernetes"
++	utilpod "k8s.io/kubernetes/pkg/api/v1/pod"
++	"k8s.io/kubernetes/test/e2e/framework"
++	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
++	imageutils "k8s.io/kubernetes/test/utils/image"
++	admissionapi "k8s.io/pod-security-admission/api"
++)
++
++const (
++	maxNodesToCheck = 10
++	maxAutoports    = 5
++
++	pollInterval = 1 * time.Second
++	timeout      = time.Second * 30
++)
++
++var _ = KubewharfDescribe("Autoport", func() {
++	f := framework.NewDefaultFramework("autport")
++	f.NamespacePodSecurityEnforceLevel = admissionapi.LevelPrivileged
++
++	var (
++		c  clientset.Interface
++		ns string
++
++		nodeNames sets.String
++	)
++
++	ginkgo.BeforeEach(func() {
++		c = f.ClientSet
++		ns = f.Namespace.Name
++
++		nodes, err := e2enode.GetBoundedReadySchedulableNodes(c, maxNodesToCheck)
++		framework.ExpectNoError(err)
++		nodeNames = sets.NewString()
++		for i := 0; i < len(nodes.Items); i++ {
++			nodeNames.Insert(nodes.Items[i].Name)
++		}
++	})
++
++	ginkgo.It("autoport should assign host port", func() {
++		podNames := sets.NewString()
++
++		for node := range nodeNames {
++			name := fmt.Sprintf("autoport-assign-hostport-%s", uuid.NewUUID())
++			pod := getPodWithAutports(name, ns, node, rand.Intn(maxAutoports)+1, false)
++
++			_, err := c.CoreV1().Pods(ns).Create(context.TODO(), pod, metav1.CreateOptions{})
++			framework.ExpectNoError(err, "creating pod with autport %s in %s")
++			podNames.Insert(name)
++		}
++
++		errCh := make(chan error, len(podNames))
++		for name := range podNames {
++			podName := name
++			go func() {
++				errMsg := ""
++				err := wait.Poll(pollInterval, timeout, func() (bool, error) {
++					pod, err := c.CoreV1().Pods(ns).Get(context.TODO(), podName, metav1.GetOptions{})
++					framework.ExpectNoError(err)
++
++					container := pod.Spec.Containers[0]
++
++					for i, port := range container.Ports {
++						autoport := strconv.Itoa(int(port.HostPort))
++						if autoport == "0" {
++							errMsg = fmt.Sprintf("autoport not assigned for pod %s in %s", podName, ns)
++							return false, nil
++						}
++
++						if i == 0 {
++							if getPortEnv(container.Env) != autoport {
++								errMsg = fmt.Sprintf("PORT env not updated for pod %s in %s", podName, ns)
++								return false, nil
++							}
++						}
++
++						if getPortEnvByID(i, container.Env) != autoport {
++							errMsg = fmt.Sprintf("PORT%d env not updated for pod %s in %s", i, podName, ns)
++							return false, nil
++						}
++					}
++
++					return true, nil
++				})
++				if err != nil {
++					errCh <- errors.New(errMsg)
++				} else {
++					errCh <- nil
++				}
++			}()
++		}
++
++		for i := 0; i < len(podNames); i++ {
++			err := <-errCh
++			framework.ExpectNoError(err)
++		}
++	})
++
++	ginkgo.It("autoport with host network should assign container and host port", func() {
++		podNames := sets.NewString()
++
++		for node := range nodeNames {
++			name := fmt.Sprintf("autoport-assign-hostport-%s", uuid.NewUUID())
++			pod := getPodWithAutports(name, ns, node, rand.Intn(maxAutoports)+1, true)
++
++			_, err := c.CoreV1().Pods(ns).Create(context.TODO(), pod, metav1.CreateOptions{})
++			framework.ExpectNoError(err, "creating pod with autport and hostnetwork %s in %s")
++			podNames.Insert(name)
++		}
++
++		errCh := make(chan error, len(podNames))
++		for name := range podNames {
++			podName := name
++			go func() {
++				errMsg := ""
++				err := wait.Poll(pollInterval, timeout, func() (bool, error) {
++					pod, err := c.CoreV1().Pods(ns).Get(context.TODO(), podName, metav1.GetOptions{})
++					framework.ExpectNoError(err)
++
++					container := pod.Spec.Containers[0]
++
++					for i, port := range container.Ports {
++						autoport := strconv.Itoa(int(port.HostPort))
++						if autoport == "0" {
++							errMsg = fmt.Sprintf("autoport not assigned for pod %s in %s", podName, ns)
++							return false, nil
++						}
++
++						containerPort := strconv.Itoa(int(port.HostPort))
++						if containerPort == "0" {
++							errMsg = fmt.Sprintf("containerPort not assigned for pod %s in %s", podName, ns)
++							return false, nil
++						}
++
++						if autoport != containerPort {
++							errMsg = fmt.Sprintf("containerPort and hostPort assigned different values for pod %s in %s", podName, ns)
++							return false, nil
++						}
++
++						if i == 0 {
++							if getPortEnv(container.Env) != autoport {
++								errMsg = fmt.Sprintf("PORT env not updated for pod %s in %s", podName, ns)
++								return false, nil
++							}
++						}
++
++						if getPortEnvByID(i, container.Env) != autoport {
++							errMsg = fmt.Sprintf("PORT%d env not updated for pod %s in %s", i, podName, ns)
++							return false, nil
++						}
++					}
++
++					return true, nil
++				})
++				if err != nil {
++					errCh <- errors.New(errMsg)
++				} else {
++					errCh <- nil
++				}
++			}()
++		}
++
++		for i := 0; i < len(podNames); i++ {
++			err := <-errCh
++			framework.ExpectNoError(err)
++		}
++	})
++})
++
++func getPodWithAutports(name, namespace, node string, numAutoports int, isHostNetwork bool) *corev1.Pod {
++	pod := &corev1.Pod{
++		ObjectMeta: metav1.ObjectMeta{
++			Name:      name,
++			Namespace: namespace,
++			Annotations: map[string]string{
++				utilpod.PodAutoPortAnnotation: "1",
++			},
++		},
++		Spec: corev1.PodSpec{
++			NodeName: node,
++			Containers: []corev1.Container{
++				{
++					Name:  "busybox",
++					Image: imageutils.GetPauseImageName(),
++				},
++			},
++		},
++	}
++
++	if isHostNetwork {
++		pod.Spec.HostNetwork = true
++	}
++
++	ports := make([]corev1.ContainerPort, numAutoports)
++	for i := 0; i < numAutoports; i++ {
++		ports[i] = corev1.ContainerPort{
++			Name:          fmt.Sprintf("autoport-%d", i),
++			HostPort:      0,
++			ContainerPort: 0,
++		}
++
++		if !isHostNetwork {
++			ports[i].ContainerPort = int32(rand.Intn(65535) + 1)
++		}
++	}
++	pod.Spec.Containers[0].Ports = ports
++
++	return pod
++}
++
++func getPortEnv(envs []corev1.EnvVar) string {
++	for _, e := range envs {
++		if e.Name == "PORT" {
++			return e.Value
++		}
++	}
++	return ""
++}
++
++func getPortEnvByID(id int, envs []corev1.EnvVar) string {
++	for _, e := range envs {
++		if e.Name == fmt.Sprintf("PORT%d", id) {
++			return e.Value
++		}
++	}
++	return ""
++}
+diff --git a/test/e2e/kubewharf/framework.go b/test/e2e/kubewharf/framework.go
+new file mode 100644
+index 00000000000..99d97ed7d3c
+--- /dev/null
++++ b/test/e2e/kubewharf/framework.go
+@@ -0,0 +1,8 @@
++package kubewharf
++
++import "github.com/onsi/ginkgo"
++
++// KubewharfDescribe annotates the test with the Kubewharf label
++func KubewharfDescribe(text string, body func()) bool {
++	return ginkgo.Describe("[kubewharf] "+text, body)
++}
