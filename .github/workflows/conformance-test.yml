@@ -1,0 +1,41 @@
+name: Conformance Test
+run-name: ${{ github.sha }}
+
+on:
+  - push
+
+jobs:
+  conformance-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Download kind
+        run: curl --insecure -Lo /usr/local/bin/kind https://kind.sigs.k8s.io/dl/v0.16.0/kind-linux-amd64
+
+      - name: Download sonobuoy
+        run: |
+          curl --insecure -Lo /tmp/sonobuoy_0.56.10_linux_amd64.tar.gz https://github.com/vmware-tanzu/sonobuoy/releases/download/v0.56.10/sonobuoy_0.56.10_linux_amd64.tar.gz
+          mkdir -p /tmp/sonobuoy
+          tar -xvf /tmp/sonobuoy_0.56.10_linux_amd64.tar.gz -C /tmp/sonobuoy
+          mv /tmp/sonobuoy/sonobuoy /usr/local/bin/sonobuoy
+
+      - name: Build cluster
+        run: make kind
+
+      - name: Run tests
+        run: sonobuoy run --mode=certified-conformance --wait
+
+      - name: Print logs
+        run: sonobuoy logs
+
+      - name: Collect results
+        run: |
+          sonobuoy retrieve --filename=sonobuoy_results.tar.gz
+          mkdir -p ./result
+          tar -xvf sonobuoy_results.tar.gz -C ./result
+
+      - uses: actions/upload-artifact@v2
+        with:
+          name: ${{ github.sha }}-results
+          path: ./result
