@@ -1,0 +1,30 @@
+name: E2E Test
+run-name: ${{ github.sha }}
+
+on:
+  push: {}
+  schedule:
+    - cron: '0 0 * * *'
+
+jobs:
+  e2e-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Download kind
+        run: curl --insecure -Lo /usr/local/bin/kind https://kind.sigs.k8s.io/dl/v0.16.0/kind-linux-amd64
+
+      - name: Build cluster
+        run: make kind
+
+      - name: Build tests
+        run: |
+          make source
+          cd _source/1.24
+          ./build/run.sh make WHAT="test/e2e/e2e.test"
+
+      - name: Run tests
+        run: |
+          cd _source/1.24
+          ./_output/dockerized/bin/linux/amd64/e2e.test -provider=local -kubeconfig=$HOME/.kube/config -test.parallel=8 -ginkgo.skip='\[Slow\]|\[Disruptive\]|\[Flaky\]|\[Feature:.+\]|PodSecurityPolicy|LoadBalancer|load.balancer|Simple.pod.should.support.exec.through.an.HTTP.proxy|subPath.should.support.existing|NFS|nfs|inline.execution.and.attach|should.be.rejected.when.no.endpoints.exist' -ginkgo.focus='.'
