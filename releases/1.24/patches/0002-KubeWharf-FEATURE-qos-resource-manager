@@ -206,7 +206,7 @@ index 80f317fae58..44ee41ae049 100644
  	// Policies other than "none" require the TopologyManager feature gate to be enabled.
  	TopologyManagerPolicy string
 diff --git a/pkg/kubelet/apis/config/v1beta1/defaults.go b/pkg/kubelet/apis/config/v1beta1/defaults.go
-index cbcdff636d2..90c2e35bad3 100644
+index cbcdff636d2..05439a11a5d 100644
 --- a/pkg/kubelet/apis/config/v1beta1/defaults.go
 +++ b/pkg/kubelet/apis/config/v1beta1/defaults.go
 @@ -163,6 +163,9 @@ func SetDefaults_KubeletConfiguration(obj *kubeletconfigv1beta1.KubeletConfigura
@@ -214,7 +214,7 @@ index cbcdff636d2..90c2e35bad3 100644
  		obj.MemoryManagerPolicy = kubeletconfigv1beta1.NoneMemoryManagerPolicy
  	}
 +	if obj.QoSResourceManagerReconcilePeriod == zeroDuration {
-+		obj.QoSResourceManagerReconcilePeriod = metav1.Duration{Duration: 5 * time.Second}
++		obj.QoSResourceManagerReconcilePeriod = metav1.Duration{Duration: 3 * time.Second}
 +	}
  	if obj.TopologyManagerPolicy == "" {
  		obj.TopologyManagerPolicy = kubeletconfigv1beta1.NoneTopologyManagerPolicy
