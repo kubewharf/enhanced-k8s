@@ -1421,10 +1421,10 @@ index 00000000000..c7f5be9ba13
 +}
 diff --git a/pkg/kubelet/cm/qosresourcemanager/manager.go b/pkg/kubelet/cm/qosresourcemanager/manager.go
 new file mode 100644
-index 00000000000..8fbef63043e
+index 00000000000..234877bc90e
 --- /dev/null
 +++ b/pkg/kubelet/cm/qosresourcemanager/manager.go
-@@ -0,0 +1,1261 @@
+@@ -0,0 +1,1263 @@
 +/*
 +Copyright 2017 The Kubernetes Authors.
 +
@@ -1465,6 +1465,7 @@ index 00000000000..8fbef63043e
 +	"k8s.io/apimachinery/pkg/util/sets"
 +	"k8s.io/apimachinery/pkg/util/wait"
 +	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
++	v1qos "k8s.io/kubernetes/pkg/apis/core/v1/helper/qos"
 +	"k8s.io/kubernetes/pkg/kubelet/checkpointmanager"
 +	"k8s.io/kubernetes/pkg/kubelet/checkpointmanager/errors"
 +	"k8s.io/kubernetes/pkg/kubelet/cm/qosresourcemanager/checkpoint"
@@ -1919,6 +1920,7 @@ index 00000000000..8fbef63043e
 +			ResourceRequests: map[string]float64{reqResource: ParseQuantityToFloat64(v)},
 +			Labels:           maputil.CopySS(pod.Labels),
 +			Annotations:      maputil.CopySS(pod.Annotations),
++			NativeQosClass:   string(v1qos.GetPodQOS(pod)),
 +		}
 +
 +		if m.resourceHasTopologyAlignment(resource) {
@@ -5090,10 +5092,10 @@ index 00000000000..593a4d553ef
 +}
 diff --git a/pkg/kubelet/cm/qosresourcemanager/topology_hints.go b/pkg/kubelet/cm/qosresourcemanager/topology_hints.go
 new file mode 100644
-index 00000000000..73f0ce12518
+index 00000000000..d3c4c04987d
 --- /dev/null
 +++ b/pkg/kubelet/cm/qosresourcemanager/topology_hints.go
-@@ -0,0 +1,173 @@
+@@ -0,0 +1,175 @@
 +/*
 +Copyright 2019 The Kubernetes Authors.
 +
@@ -5120,6 +5122,7 @@ index 00000000000..73f0ce12518
 +	v1 "k8s.io/api/core/v1"
 +	"k8s.io/klog/v2"
 +	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
++	v1qos "k8s.io/kubernetes/pkg/apis/core/v1/helper/qos"
 +	"k8s.io/kubernetes/pkg/kubelet/cm/topologymanager"
 +	"k8s.io/kubernetes/pkg/kubelet/metrics"
 +	maputil "k8s.io/kubernetes/pkg/util/maps"
@@ -5226,6 +5229,7 @@ index 00000000000..73f0ce12518
 +				ResourceName: resource,
 +				// use original requested resource name in "ResourceRequests" in order to make plugin identity real requested resource name
 +				ResourceRequests: map[string]float64{reqResource: ParseQuantityToFloat64(requestedObj)},
++				NativeQosClass:   string(v1qos.GetPodQOS(pod)),
 +			}
 +
 +			resp, err := eI.e.getTopologyHints(context.Background(), resourceReq)
