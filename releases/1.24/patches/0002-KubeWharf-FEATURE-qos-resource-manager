@@ -1421,10 +1421,10 @@ index 00000000000..c7f5be9ba13
 +}
 diff --git a/pkg/kubelet/cm/qosresourcemanager/manager.go b/pkg/kubelet/cm/qosresourcemanager/manager.go
 new file mode 100644
-index 00000000000..8fbef63043e
+index 00000000000..61eb77462b3
 --- /dev/null
 +++ b/pkg/kubelet/cm/qosresourcemanager/manager.go
-@@ -0,0 +1,1261 @@
+@@ -0,0 +1,1280 @@
 +/*
 +Copyright 2017 The Kubernetes Authors.
 +
@@ -1547,7 +1547,7 @@ index 00000000000..8fbef63043e
 +}
 +
 +func newManagerImpl(socketPath string, topologyAffinityStore topologymanager.Store, reconcilePeriod time.Duration, resourceNamesMap map[string]string) (*ManagerImpl, error) {
-+	klog.V(2).Infof("[qosresourcemanager] Creating Resource Plugin manager at %s", socketPath)
++	klog.V(2).Infof("[qosresourcemanager.newManagerImpl] Creating Resource Plugin manager at %s", socketPath)
 +
 +	if socketPath == "" || !filepath.IsAbs(socketPath) {
 +		return nil, fmt.Errorf(errBadSocket+" %s", socketPath)
@@ -1598,7 +1598,7 @@ index 00000000000..8fbef63043e
 +		}
 +		stat, err := os.Stat(filePath)
 +		if err != nil {
-+			klog.Errorf("[qosresourcemanager] Failed to stat file %s: %v", filePath, err)
++			klog.Errorf("[qosresourcemanager.removeContents] Failed to stat file %s: %v", filePath, err)
 +			continue
 +		}
 +		if stat.IsDir() {
@@ -1607,7 +1607,7 @@ index 00000000000..8fbef63043e
 +		err = os.RemoveAll(filePath)
 +		if err != nil {
 +			errs = append(errs, err)
-+			klog.Errorf("[qosresourcemanager] Failed to remove file %s: %v", filePath, err)
++			klog.Errorf("[qosresourcemanager.removeContents] Failed to remove file %s: %v", filePath, err)
 +			continue
 +		}
 +	}
@@ -1623,7 +1623,7 @@ index 00000000000..8fbef63043e
 +// podResources and allocatedScalarResourcesQuantity information from checkpointed state and
 +// starts resource plugin registration service.
 +func (m *ManagerImpl) Start(activePods ActivePodsFunc, sourcesReady config.SourcesReady, podStatusProvider status.PodStatusProvider, containerRuntime runtimeService) error {
-+	klog.V(2).Infof("[qosresourcemanager] Starting Resource Plugin manager")
++	klog.V(2).Infof("[qosresourcemanager.Start] Starting Resource Plugin manager")
 +
 +	m.activePods = activePods
 +	m.sourcesReady = sourcesReady
@@ -1633,7 +1633,7 @@ index 00000000000..8fbef63043e
 +	// Loads in podResources information from disk.
 +	err := m.readCheckpoint()
 +	if err != nil {
-+		klog.Warningf("[qosresourcemanager] Continue after failing to read checkpoint file. Resource allocation info may NOT be up-to-date. Err: %v", err)
++		klog.Warningf("[qosresourcemanager.Start] Continue after failing to read checkpoint file. Resource allocation info may NOT be up-to-date. Err: %v", err)
 +	}
 +
 +	socketPath := filepath.Join(m.socketdir, m.socketname)
@@ -1643,14 +1643,14 @@ index 00000000000..8fbef63043e
 +	}
 +	if selinux.GetEnabled() {
 +		if err := selinux.SetFileLabel(m.socketdir, config.KubeletPluginsDirSELinuxLabel); err != nil {
-+			klog.Warningf("[qosresourcemanager] Unprivileged containerized plugins might not work. Could not set selinux context on %s: %v", m.socketdir, err)
++			klog.Warningf("[qosresourcemanager.Start] Unprivileged containerized plugins might not work. Could not set selinux context on %s: %v", m.socketdir, err)
 +		}
 +	}
 +
 +	// Removes all stale sockets in m.socketdir. Resource plugins can monitor
 +	// this and use it as a signal to re-register with the new Kubelet.
 +	if err := m.removeContents(m.socketdir); err != nil {
-+		klog.Errorf("[qosresourcemanager] Fail to clean up stale contents under %s: %v", m.socketdir, err)
++		klog.Errorf("[qosresourcemanager.Start] Fail to clean up stale contents under %s: %v", m.socketdir, err)
 +	}
 +
 +	s, err := net.Listen("unix", socketPath)
@@ -1666,20 +1666,20 @@ index 00000000000..8fbef63043e
 +
 +	ctx, cancel := context.WithCancel(context.Background())
 +
-+	klog.V(2).Infof("[qosresourcemanager] Serving resource plugin registration server on %q", socketPath)
++	klog.V(2).Infof("[qosresourcemanager.Start] Serving resource plugin registration server on %q", socketPath)
 +	go func() {
 +		defer func() {
 +			m.wg.Done()
 +			cancel()
 +
 +			if err := recover(); err != nil {
-+				klog.Fatalf("[qosresourcemanager] Start recover from err: %v", err)
++				klog.Fatalf("[qosresourcemanager.Start] Start recover from err: %v", err)
 +			}
 +		}()
 +		m.server.Serve(s)
 +	}()
 +
-+	klog.Infof("[qosresourcemanager] reconciling every %v", m.reconcilePeriod)
++	klog.Infof("[qosresourcemanager.Start] reconciling every %v", m.reconcilePeriod)
 +
 +	// Periodically call m.reconcileState() to continue to keep the resources allocation for
 +	// all active pods in sync with the latest result allocated by corresponding resource plugin
@@ -1713,7 +1713,7 @@ index 00000000000..8fbef63043e
 +
 +// RegisterPlugin starts the endpoint and registers it
 +func (m *ManagerImpl) RegisterPlugin(pluginName string, endpoint string, versions []string) error {
-+	klog.V(2).Infof("[qosresourcemanager] Registering Plugin %s at endpoint %s", pluginName, endpoint)
++	klog.V(2).Infof("[qosresourcemanager.RegisterPlugin] Registering Plugin %s at endpoint %s", pluginName, endpoint)
 +
 +	e, err := newEndpointImpl(endpoint, pluginName)
 +	if err != nil {
@@ -1824,7 +1824,7 @@ index 00000000000..8fbef63043e
 +	}
 +
 +	if isSkippedPod(pod, !isReAllocation) {
-+		klog.Infof("[qosresourcemanager] skip pod: %s/%s, container: %s resource allocation with isReAllocation: %v",
++		klog.Infof("[qosresourcemanager.allocateContainerResources] skip pod: %s/%s, container: %s resource allocation with isReAllocation: %v",
 +			pod.Namespace, pod.Name, container.Name, isReAllocation)
 +		return nil
 +	}
@@ -1844,11 +1844,11 @@ index 00000000000..8fbef63043e
 +		}
 +
 +		if !m.isResourcePluginResource(resource) {
-+			klog.Infof("[qosresourcemanager] resource %s is not supported by any resource plugin", resource)
++			klog.Infof("[qosresourcemanager.allocateContainerResources] resource %s is not supported by any resource plugin", resource)
 +			continue
 +		}
 +
-+		klog.Infof("[qosresourcemanager] pod: %s/%s container: %s needs %d %s",
++		klog.Infof("[qosresourcemanager.allocateContainerResources] pod: %s/%s container: %s needs %d %s",
 +			pod.Namespace, pod.Name, container.Name, needed, reqResource)
 +
 +		// Updates allocated resources to garbage collect any stranded resources
@@ -1869,11 +1869,12 @@ index 00000000000..8fbef63043e
 +			allocated := int(math.Ceil(allocationInfo.AllocatedQuantity))
 +
 +			if allocationInfo.IsScalarResource && allocated >= needed {
-+				klog.Infof("[qosresourcemanager] resource %s already allocated to (pod %s/%s, container %v) with larger number than request: requested: %d, allocated: %d; not to allocate",
++				klog.Infof("[qosresourcemanager.allocateContainerResources] resource %s already allocated to"+
++					" (pod %s/%s, container %v) with larger number than request: requested: %d, allocated: %d; not to allocate",
 +					resource, pod.GetNamespace(), pod.GetName(), container.Name, needed, allocated)
 +				continue
 +			} else {
-+				klog.Warningf("[qosresourcemanager] resource %s already allocated to (pod %s/%s, container %v) with smaller number than request: requested: %d, allocated: %d; continue to allocate",
++				klog.Warningf("[qosresourcemanager.allocateContainerResources] resource %s already allocated to (pod %s/%s, container %v) with smaller number than request: requested: %d, allocated: %d; continue to allocate",
 +					resource, pod.GetNamespace(), pod.GetName(), container.Name, needed, allocated)
 +			}
 +		}
@@ -1900,7 +1901,7 @@ index 00000000000..8fbef63043e
 +
 +		// TODO: refactor this part of code to just append a ContainerAllocationRequest
 +		// in a passed in AllocateRequest pointer, and issues a single Allocate call per pod.
-+		klog.V(3).Infof("[qosresourcemanager] making allocation request of %.3f resources %s for pod: %s/%s; container: %s",
++		klog.V(3).Infof("[qosresourcemanager.allocateContainerResources] making allocation request of %.3f resources %s for pod: %s/%s; container: %s",
 +			ParseQuantityToFloat64(v), reqResource, pod.Namespace, pod.Name, container.Name)
 +
 +		resourceReq := &pluginapi.ResourceRequest{
@@ -1925,10 +1926,10 @@ index 00000000000..8fbef63043e
 +			hint := m.topologyAffinityStore.GetAffinity(podUID, contName)
 +
 +			if hint.NUMANodeAffinity == nil {
-+				klog.Warningf("[qosresourcemanager] pod: %s/%s; container: %s allocate resouce: %s without numa nodes affinity",
++				klog.Warningf("[qosresourcemanager.allocateContainerResources] pod: %s/%s; container: %s allocate resouce: %s without numa nodes affinity",
 +					pod.Namespace, pod.Name, container.Name, resource)
 +			} else {
-+				klog.Warningf("[qosresourcemanager] pod: %s/%s; container: %s allocate resouce: %s get hint: %v from store",
++				klog.Warningf("[qosresourcemanager.allocateContainerResources] pod: %s/%s; container: %s allocate resouce: %s get hint: %v from store",
 +					pod.Namespace, pod.Name, container.Name, resource, hint)
 +			}
 +
@@ -1940,7 +1941,7 @@ index 00000000000..8fbef63043e
 +		if err != nil {
 +			errMsg := fmt.Sprintf("allocate for resources %s for pod: %s/%s, container: %s got error: %v",
 +				resource, pod.Namespace, pod.Name, container.Name, err)
-+			klog.Errorf("[qosresourcemanager] %s", errMsg)
++			klog.Errorf("[qosresourcemanager.allocateContainerResources] %s", errMsg)
 +
 +			// is case of endpoint not working, pass some types of pods don't necessarily require resource allocation.
 +			if canSkipEndpointError(pod, resource) {
@@ -1954,7 +1955,7 @@ index 00000000000..8fbef63043e
 +
 +		// Update internal cached podResources state.
 +		if resp.AllocationResult == nil {
-+			klog.Warningf("[qosresourcemanager] allocation request for resources %s for pod: %s/%s, container: %s got nil allocation result",
++			klog.Warningf("[qosresourcemanager.allocateContainerResources] allocation request for resources %s for pod: %s/%s, container: %s got nil allocation result",
 +				resource, pod.Namespace, pod.Name, container.Name)
 +			continue
 +		}
@@ -1962,12 +1963,12 @@ index 00000000000..8fbef63043e
 +		// [TODO](sunjianyu): to think abount a method to aviod accompanying resouce names conflict
 +		for accResourceName, allocationInfo := range resp.AllocationResult.ResourceAllocation {
 +			if allocationInfo == nil {
-+				klog.Warningf("[qosresourcemanager] allocation request for resources %s - accompanying resource: %s for pod: %s/%s, container: %s got nil allocation infomation",
++				klog.Warningf("[qosresourcemanager.allocateContainerResources] allocation request for resources %s - accompanying resource: %s for pod: %s/%s, container: %s got nil allocation information",
 +					resource, accResourceName, pod.Namespace, pod.Name, container.Name)
 +				continue
 +			}
 +
-+			klog.V(4).Infof("[qosresourcemanager] allocation information for resources %s - accompanying resource: %s for pod: %s/%s, container: %s is %v",
++			klog.V(4).Infof("[qosresourcemanager.allocateContainerResources] allocation information for resources %s - accompanying resource: %s for pod: %s/%s, container: %s is %v",
 +				resource, accResourceName, pod.Namespace, pod.Name, container.Name, *allocationInfo)
 +
 +			m.podResources.insert(podUID, contName, accResourceName, allocationInfo)
@@ -1999,7 +2000,7 @@ index 00000000000..8fbef63043e
 +
 +// Register registers a resource plugin.
 +func (m *ManagerImpl) Register(ctx context.Context, r *pluginapi.RegisterRequest) (*pluginapi.Empty, error) {
-+	klog.Infof("[qosresourcemanager] Got registration request from resource plugin with resource name %q", r.ResourceName)
++	klog.Infof("[qosresourcemanager.Register] Got registration request from resource plugin with resource name %q", r.ResourceName)
 +	metrics.ResourcePluginRegistrationCount.WithLabelValues(r.ResourceName).Inc()
 +	var versionCompatible bool
 +	for _, v := range pluginapi.SupportedVersions {
@@ -2010,7 +2011,7 @@ index 00000000000..8fbef63043e
 +	}
 +	if !versionCompatible {
 +		errorString := fmt.Sprintf(errUnsupportedVersion, r.Version, pluginapi.SupportedVersions)
-+		klog.Infof("Bad registration request from resource plugin with resource name %q: %s", r.ResourceName, errorString)
++		klog.Infof("[qosresourcemanager.Register] Bad registration request from resource plugin with resource name %q: %s", r.ResourceName, errorString)
 +		return &pluginapi.Empty{}, fmt.Errorf(errorString)
 +	}
 +
@@ -2023,13 +2024,13 @@ index 00000000000..8fbef63043e
 +	select {
 +	case pass := <-success:
 +		if pass {
-+			klog.Infof("[qosresourcemanager] Register resource plugin for %s success", r.ResourceName)
++			klog.Infof("[qosresourcemanager.Register] Register resource plugin for %s success", r.ResourceName)
 +			return &pluginapi.Empty{}, nil
 +		}
-+		klog.Errorf("[qosresourcemanager] Register resource plugin for %s fail", r.ResourceName)
++		klog.Errorf("[qosresourcemanager.Register] Register resource plugin for %s fail", r.ResourceName)
 +		return &pluginapi.Empty{}, fmt.Errorf("failed to register resource %s", r.ResourceName)
 +	case <-ctx.Done():
-+		klog.Errorf("[qosresourcemanager] Register resource plugin for %s timeout", r.ResourceName)
++		klog.Errorf("[qosresourcemanager.Register] Register resource plugin for %s timeout", r.ResourceName)
 +		return &pluginapi.Empty{}, fmt.Errorf("timeout to register resource %s", r.ResourceName)
 +	}
 +}
@@ -2060,18 +2061,18 @@ index 00000000000..8fbef63043e
 +	old, ok := m.endpoints[resourceName]
 +
 +	if ok && !old.e.isStopped() {
-+		klog.V(2).Infof("[qosresourcemanager] stop old endpoint: %v", old.e)
++		klog.V(2).Infof("[qosresourcemanager.registerEndpoint] stop old endpoint: %v", old.e)
 +		old.e.stop()
 +	}
 +
 +	m.endpoints[resourceName] = endpointInfo{e: e, opts: options}
-+	klog.V(2).Infof("[qosresourcemanager] Registered endpoint %v", e)
++	klog.V(2).Infof("[qosresourcemanager.registerEndpoint] Registered endpoint %v", e)
 +}
 +
 +func (m *ManagerImpl) addEndpoint(r *pluginapi.RegisterRequest, success chan<- bool) {
 +	new, err := newEndpointImpl(filepath.Join(m.socketdir, r.Endpoint), r.ResourceName)
 +	if err != nil {
-+		klog.Errorf("[qosresourcemanager] Failed to dial resource plugin with request %v: %v", r, err)
++		klog.Errorf("[qosresourcemanager.registerEndpoint] Failed to dial resource plugin with request %v: %v", r, err)
 +		success <- false
 +		return
 +	}
@@ -2085,7 +2086,7 @@ index 00000000000..8fbef63043e
 +	if pod == nil || container == nil {
 +		return nil, fmt.Errorf("GetTopologyAwareResources got nil pod: %v or container: %v", pod, container)
 +	} else if isSkippedPod(pod, false) {
-+		klog.V(4).Infof("[qosresourcemanager] skip pod: %s/%s, container: %s GetTopologyAwareResources",
++		klog.V(4).Infof("[qosresourcemanager.GetTopologyAwareResources] skip pod: %s/%s, container: %s GetTopologyAwareResources",
 +			pod.Namespace, pod.Name, container.Name)
 +		return nil, nil
 +	}
@@ -2096,8 +2097,21 @@ index 00000000000..8fbef63043e
 +	m.mutex.Lock()
 +	for resourceName, eI := range m.endpoints {
 +		if eI.e.isStopped() {
-+			klog.Warningf("[qosresourcemanager] skip GetTopologyAwareResources of resource: %s for pod: %s container: %s, because plugin stopped",
-+				resourceName, podUID, containerName)
++			// [TODO]: how to avoid vibration when endpoint stopped
++			klog.Warningf("[qosresourcemanager.GetTopologyAwareResources] skip GetTopologyAwareResources of resource: %s for pod: %s/%s container: %s, because plugin stopped",
++				resourceName, pod.Namespace, pod.Name, containerName)
++			continue
++		}
++
++		isRequested, err := m.isContainerRequestResource(container, resourceName)
++
++		if err != nil {
++			return nil, fmt.Errorf("isContainerRequestResource failed with error: %v", err)
++		}
++
++		if !isRequested {
++			klog.Infof("[qosresourcemanager.GetTopologyAwareResources] pod: %s/%s container: %s doesn't request: %s",
++				pod.Namespace, pod.Name, containerName, resourceName)
 +			continue
 +		}
 +
@@ -2114,7 +2128,7 @@ index 00000000000..8fbef63043e
 +			//[TODO](sunjianyu): to discuss if we should return err if only one resource plugin gets error?
 +			return nil, fmt.Errorf("getTopologyAwareResources for resource: %s failed with error: %v", resourceName, err)
 +		} else if curResp == nil {
-+			klog.Warningf("[qosresourcemanager] getTopologyAwareResources of resource: %s for pod: %s container: %s, got nil response but without error",
++			klog.Warningf("[qosresourcemanager.GetTopologyAwareResources] getTopologyAwareResources of resource: %s for pod: %s container: %s, got nil response but without error",
 +				resourceName, podUID, containerName)
 +			continue
 +		}
@@ -2138,7 +2152,8 @@ index 00000000000..8fbef63043e
 +				}
 +			}
 +		} else {
-+			klog.Warningf("[qosresourcemanager] getTopologyAwareResources of resource: %s for pod: %s container: %s, get nil resp or nil topologyAwareResources in resp",
++			klog.Warningf("[qosresourcemanager.GetTopologyAwareResources] getTopologyAwareResources of resource: %s for pod: %s container: %s,"+
++				" get nil resp or nil topologyAwareResources in resp",
 +				resourceName, podUID, containerName)
 +		}
 +	}
@@ -2152,7 +2167,7 @@ index 00000000000..8fbef63043e
 +	m.mutex.Lock()
 +	for resourceName, eI := range m.endpoints {
 +		if eI.e.isStopped() {
-+			klog.Warningf("[qosresourcemanager] skip GetTopologyAwareAllocatableResources of resource: %s, because plugin stopped", resourceName)
++			klog.Warningf("[qosresourcemanager.GetTopologyAwareAllocatableResources] skip GetTopologyAwareAllocatableResources of resource: %s, because plugin stopped", resourceName)
 +			continue
 +		}
 +		ctx := metadata.NewOutgoingContext(context.Background(), metadata.New(nil))
@@ -2165,7 +2180,7 @@ index 00000000000..8fbef63043e
 +			//[TODO](sunjianyu): to discuss if we should return err if only one resource plugin gets error?
 +			return nil, fmt.Errorf("getTopologyAwareAllocatableResources for resource: %s failed with error: %v", resourceName, err)
 +		} else if curResp == nil {
-+			klog.Warningln("[qosresourcemanager] getTopologyAwareAllocatableResources got nil response but without error")
++			klog.Warningln("[qosresourcemanager.GetTopologyAwareAllocatableResources] getTopologyAwareAllocatableResources got nil response but without error")
 +			continue
 +		}
 +
@@ -2182,7 +2197,8 @@ index 00000000000..8fbef63043e
 +				}
 +			}
 +		} else {
-+			klog.Warningf("[qosresourcemanager] getTopologyAwareAllocatableResources of resource: %s, get nil resp or nil topologyAwareResources in resp", resourceName)
++			klog.Warningf("[qosresourcemanager.GetTopologyAwareAllocatableResources] getTopologyAwareAllocatableResources of"+
++				" resource: %s, get nil resp or nil topologyAwareResources in resp", resourceName)
 +		}
 +	}
 +	m.mutex.Unlock()
@@ -2212,7 +2228,7 @@ index 00000000000..8fbef63043e
 +
 +		if eI.e.stopGracePeriodExpired() {
 +			if !implicitIsNodeResource {
-+				klog.Infof("[qosresourcemanager] skip GetCapacity for resource: %s with implicitIsNodeResource: %v", resourceName, implicitIsNodeResource)
++				klog.Infof("[qosresourcemanager.GetCapacity] skip GetCapacity for resource: %s with implicitIsNodeResource: %v", resourceName, implicitIsNodeResource)
 +				continue
 +			}
 +			delete(m.endpoints, resourceName)
@@ -2223,9 +2239,9 @@ index 00000000000..8fbef63043e
 +			resp, err := eI.e.getTopologyAwareAllocatableResources(ctx, &pluginapi.GetTopologyAwareAllocatableResourcesRequest{})
 +			m.mutex.Lock()
 +			if err != nil {
-+				klog.Errorf("[qosresourcemanager] getTopologyAwareAllocatableResources for resource: %s failed with error: %v", resourceName, err)
++				klog.Errorf("[qosresourcemanager.GetCapacity] getTopologyAwareAllocatableResources for resource: %s failed with error: %v", resourceName, err)
 +				if !implicitIsNodeResource {
-+					klog.Infof("[qosresourcemanager] skip GetCapacity for resource: %s with implicitIsNodeResource: %v", resourceName, implicitIsNodeResource)
++					klog.Infof("[qosresourcemanager.GetCapacity] skip GetCapacity for resource: %s with implicitIsNodeResource: %v", resourceName, implicitIsNodeResource)
 +					continue
 +				}
 +				// [TODO](sunjianyu): consider if it will cause resource quantity vibrating?
@@ -2234,9 +2250,9 @@ index 00000000000..8fbef63043e
 +			} else if resp == nil ||
 +				resp.AllocatableResources == nil ||
 +				len(resp.AllocatableResources) == 0 {
-+				klog.Warningf("[qosresourcemanager] getTopologyAwareAllocatableResources for resource: %s got nil response or empty content in response", resourceName)
++				klog.Warningf("[qosresourcemanager.GetCapacity] getTopologyAwareAllocatableResources for resource: %s got nil response or empty content in response", resourceName)
 +				if !implicitIsNodeResource {
-+					klog.Infof("[qosresourcemanager] skip GetCapacity for resource: %s with implicitIsNodeResource: %v", resourceName, implicitIsNodeResource)
++					klog.Infof("[qosresourcemanager.GetCapacity] skip GetCapacity for resource: %s with implicitIsNodeResource: %v", resourceName, implicitIsNodeResource)
 +					continue
 +				}
 +				capacity[v1.ResourceName(resourceName)] = *resource.NewQuantity(0, resource.DecimalSI)
@@ -2245,7 +2261,7 @@ index 00000000000..8fbef63043e
 +				for accResourceName, taResource := range resp.AllocatableResources {
 +
 +					if taResource == nil {
-+						klog.Errorf("[qosresourcemanager] accResourceName: %s with nil topology aware resource", accResourceName)
++						klog.Errorf("[qosresourcemanager.GetCapacity] accResourceName: %s with nil topology aware resource", accResourceName)
 +						capacity[v1.ResourceName(accResourceName)] = *resource.NewQuantity(0, resource.DecimalSI)
 +						allocatable[v1.ResourceName(accResourceName)] = *resource.NewQuantity(0, resource.DecimalSI)
 +						continue
@@ -2270,7 +2286,8 @@ index 00000000000..8fbef63043e
 +	data := checkpoint.New(m.podResources.toCheckpointData())
 +	err := m.checkpointManager.CreateCheckpoint(kubeletQoSResourceManagerCheckpoint, data)
 +	if err != nil {
-+		err2 := fmt.Errorf("[qosresourcemanager] failed to write checkpoint file %q: %v", kubeletQoSResourceManagerCheckpoint, err)
++		err2 := fmt.Errorf("[qosresourcemanager.writeCheckpoint] failed to write checkpoint file %q: %v",
++			kubeletQoSResourceManagerCheckpoint, err)
 +		klog.Warning(err2)
 +		return err2
 +	}
@@ -2285,7 +2302,8 @@ index 00000000000..8fbef63043e
 +	err := m.checkpointManager.GetCheckpoint(kubeletQoSResourceManagerCheckpoint, cp)
 +	if err != nil {
 +		if err == errors.ErrCheckpointNotFound {
-+			klog.Warningf("[qosresourcemanager] Failed to retrieve checkpoint for %q: %v", kubeletQoSResourceManagerCheckpoint, err)
++			klog.Warningf("[qosresourcemanager.readCheckpoint] Failed to retrieve checkpoint for %q: %v",
++				kubeletQoSResourceManagerCheckpoint, err)
 +			return nil
 +		}
 +		return err
@@ -2324,7 +2342,7 @@ index 00000000000..8fbef63043e
 +	}
 +
 +	podsToBeRemovedList := podsToBeRemoved.UnsortedList()
-+	klog.V(3).Infof("[qosresourcemanager] pods to be removed: %v", podsToBeRemovedList)
++	klog.V(3).Infof("[qosresourcemanager.UpdateAllocatedResources] pods to be removed: %v", podsToBeRemovedList)
 +
 +	m.mutex.Lock()
 +	for _, podUID := range podsToBeRemovedList {
@@ -2332,7 +2350,7 @@ index 00000000000..8fbef63043e
 +		allSuccess := true
 +		for resourceName, eI := range m.endpoints {
 +			if eI.e.isStopped() {
-+				klog.Warningf("[qosresourcemanager] skip removePods: %+v of resource: %s, because plugin stopped", podsToBeRemovedList, resourceName)
++				klog.Warningf("[qosresourcemanager.UpdateAllocatedResources] skip removePods: %+v of resource: %s, because plugin stopped", podsToBeRemovedList, resourceName)
 +				continue
 +			}
 +
@@ -2399,7 +2417,7 @@ index 00000000000..8fbef63043e
 +	if pod == nil || container == nil {
 +		return nil, fmt.Errorf("GetResourceRunContainerOptions got nil pod: %v or container: %v", pod, container)
 +	} else if isSkippedPod(pod, true) {
-+		klog.V(4).Infof("[qosresourcemanager] skip pod: %s/%s, container: %s resource allocation",
++		klog.V(4).Infof("[qosresourcemanager.GetResourceRunContainerOptions] skip pod: %s/%s, container: %s GetResourceRunContainerOptions",
 +			pod.Namespace, pod.Name, container.Name)
 +		return nil, nil
 +	}
@@ -2441,7 +2459,8 @@ index 00000000000..8fbef63043e
 +		}
 +	}
 +	if needsReAllocate && !isSkippedContainer(pod, container) {
-+		klog.V(2).Infof("[qosresourcemanager] needs re-allocate resource plugin resources for pod %s, container %s during GetResourceRunContainerOptions", podUID, container.Name)
++		klog.V(2).Infof("[qosresourcemanager.GetResourceRunContainerOptions] needs re-allocate resource plugin resources"+
++			" for pod %s, container %s during GetResourceRunContainerOptions", podUID, container.Name)
 +		if err := m.reAllocate(pod, container); err != nil {
 +			return nil, err
 +		}
@@ -2462,12 +2481,12 @@ index 00000000000..8fbef63043e
 +
 +	if eI.opts == nil || !eI.opts.PreStartRequired {
 +		m.mutex.Unlock()
-+		klog.V(4).Infof("[qosresourcemanager] resource plugin options indicate to skip PreStartContainer for resource: %s", resource)
++		klog.V(4).Infof("[qosresourcemanager.callPreStartContainerIfNeeded] resource plugin options indicate to skip PreStartContainer for resource: %s", resource)
 +		return nil
 +	}
 +
 +	m.mutex.Unlock()
-+	klog.V(4).Infof("[qosresourcemanager] Issuing an PreStartContainer call for container, %s, of pod %s", container.Name, pod.Name)
++	klog.V(4).Infof("[qosresourcemanager.callPreStartContainerIfNeeded] Issuing an PreStartContainer call for container, %s, of pod %s", container.Name, pod.Name)
 +	_, err := eI.e.preStartContainer(pod, container)
 +	if err != nil {
 +		return fmt.Errorf("resource plugin PreStartContainer rpc failed with err: %v", err)
@@ -2574,7 +2593,7 @@ index 00000000000..8fbef63043e
 +		if pod == nil {
 +			continue
 +		} else if isSkippedPod(pod, false) {
-+			klog.V(4).Infof("[qosresourcemanager] skip active pod: %s/%s reconcile", pod.Namespace, pod.Name)
++			klog.V(4).Infof("[qosresourcemanager.reconcileState] skip active pod: %s/%s reconcile", pod.Namespace, pod.Name)
 +			continue
 +		}
 +
@@ -2627,10 +2646,10 @@ index 00000000000..8fbef63043e
 +			}
 +
 +			if needsReAllocate && !isSkippedContainer(pod, &pod.Spec.Containers[i]) {
-+				klog.Infof("[qosresourcemanager] needs re-allocate resource plugin resources for pod %s/%s, container %s during reconcileState",
++				klog.Infof("[qosresourcemanager.reconcileState] needs re-allocate resource plugin resources for pod %s/%s, container %s during reconcileState",
 +					pod.Namespace, pod.Name, containerName)
 +				if err := m.reAllocate(pod, &pod.Spec.Containers[i]); err != nil {
-+					klog.Errorf("[qosresourcemanager] re-allocate resource plugin resources for pod %s/%s, container %s during reconcileState failed with error: %v",
++					klog.Errorf("[qosresourcemanager.reconcileState] re-allocate resource plugin resources for pod %s/%s, container %s during reconcileState failed with error: %v",
 +						pod.Namespace, pod.Name, containerName, err)
 +					continue
 +				}
