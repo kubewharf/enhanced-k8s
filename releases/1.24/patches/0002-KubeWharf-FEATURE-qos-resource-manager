@@ -1,8 +1,16 @@
 diff --git a/api/api-rules/violation_exceptions.list b/api/api-rules/violation_exceptions.list
-index c8d8fe4c697..e72b7a670c7 100644
+index c8d8fe4c697..1cffeac6a1b 100644
 --- a/api/api-rules/violation_exceptions.list
 +++ b/api/api-rules/violation_exceptions.list
-@@ -591,6 +591,8 @@ API rule violation: names_match,k8s.io/kube-controller-manager/config/v1alpha1,V
+@@ -360,6 +360,7 @@ API rule violation: list_type_missing,k8s.io/kubelet/config/v1beta1,CredentialPr
+ API rule violation: list_type_missing,k8s.io/kubelet/config/v1beta1,KubeletConfiguration,AllowedUnsafeSysctls
+ API rule violation: list_type_missing,k8s.io/kubelet/config/v1beta1,KubeletConfiguration,ClusterDNS
+ API rule violation: list_type_missing,k8s.io/kubelet/config/v1beta1,KubeletConfiguration,EnforceNodeAllocatable
++API rule violation: list_type_missing,k8s.io/kubelet/config/v1beta1,KubeletConfiguration,NumericTopologyAlignResources
+ API rule violation: list_type_missing,k8s.io/kubelet/config/v1beta1,KubeletConfiguration,RegisterWithTaints
+ API rule violation: list_type_missing,k8s.io/kubelet/config/v1beta1,KubeletConfiguration,ReservedMemory
+ API rule violation: list_type_missing,k8s.io/kubelet/config/v1beta1,KubeletConfiguration,ShutdownGracePeriodByPodPriority
+@@ -591,6 +592,8 @@ API rule violation: names_match,k8s.io/kube-controller-manager/config/v1alpha1,V
  API rule violation: names_match,k8s.io/kube-proxy/config/v1alpha1,KubeProxyConfiguration,IPTables
  API rule violation: names_match,k8s.io/kubelet/config/v1beta1,KubeletConfiguration,IPTablesDropBit
  API rule violation: names_match,k8s.io/kubelet/config/v1beta1,KubeletConfiguration,IPTablesMasqueradeBit
@@ -12,7 +20,7 @@ index c8d8fe4c697..e72b7a670c7 100644
  API rule violation: names_match,k8s.io/metrics/pkg/apis/custom_metrics/v1beta1,MetricValue,WindowSeconds
  API rule violation: names_match,k8s.io/metrics/pkg/apis/external_metrics/v1beta1,ExternalMetricValue,WindowSeconds
 diff --git a/cmd/kubelet/app/options/options.go b/cmd/kubelet/app/options/options.go
-index c7a1bb2e7ac..38e596672c9 100644
+index c7a1bb2e7ac..544deebb41d 100644
 --- a/cmd/kubelet/app/options/options.go
 +++ b/cmd/kubelet/app/options/options.go
 @@ -450,6 +450,8 @@ func AddKubeletConfigFlags(mainfs *pflag.FlagSet, c *kubeletconfig.KubeletConfig
@@ -24,8 +32,15 @@ index c7a1bb2e7ac..38e596672c9 100644
  	fs.Var(cliflag.NewMapStringString(&c.QOSReserved), "qos-reserved", "<Warning: Alpha feature> A set of ResourceName=Percentage (e.g. memory=50%) pairs that describe how pod resource requests are reserved at the QoS level. Currently only memory is supported. Requires the QOSReserved feature gate to be enabled.")
  	fs.StringVar(&c.TopologyManagerPolicy, "topology-manager-policy", c.TopologyManagerPolicy, "Topology Manager policy to use. Possible values: 'none', 'best-effort', 'restricted', 'single-numa-node'.")
  	fs.DurationVar(&c.RuntimeRequestTimeout.Duration, "runtime-request-timeout", c.RuntimeRequestTimeout.Duration, "Timeout of all runtime requests except long running request - pull, logs, exec and attach. When timeout exceeded, kubelet will cancel the request, throw out an error and retry later.")
+@@ -513,4 +515,6 @@ func AddKubeletConfigFlags(mainfs *pflag.FlagSet, c *kubeletconfig.KubeletConfig
+ 	fs.BoolVar(&c.RegisterNode, "register-node", c.RegisterNode, "Register the node with the apiserver. If --kubeconfig is not provided, this flag is irrelevant, as the Kubelet won't have an apiserver to register with.")
+ 
+ 	fs.Var(&utilflag.RegisterWithTaintsVar{Value: &c.RegisterWithTaints}, "register-with-taints", "Register the node with the given list of taints (comma separated \"<key>=<value>:<effect>\"). No-op if register-node is false.")
++
++	fs.StringSliceVar(&c.NumericTopologyAlignResources, "numeric-topology-align-resources", c.NumericTopologyAlignResources, "A list of resources need to be aligned in numeric topology policy. [default='cpu,memory']")
+ }
 diff --git a/cmd/kubelet/app/server.go b/cmd/kubelet/app/server.go
-index 8ac37d97292..07d67ffbc32 100644
+index 8ac37d97292..41d62f93520 100644
 --- a/cmd/kubelet/app/server.go
 +++ b/cmd/kubelet/app/server.go
 @@ -95,6 +95,7 @@ import (
@@ -36,7 +51,7 @@ index 8ac37d97292..07d67ffbc32 100644
  	nodeutil "k8s.io/kubernetes/pkg/util/node"
  	"k8s.io/kubernetes/pkg/util/oom"
  	"k8s.io/kubernetes/pkg/util/rlimit"
-@@ -725,17 +726,19 @@ func run(ctx context.Context, s *options.KubeletServer, kubeDeps *kubelet.Depend
+@@ -725,21 +726,24 @@ func run(ctx context.Context, s *options.KubeletServer, kubeDeps *kubelet.Depend
  					ReservedSystemCPUs:       reservedSystemCPUs,
  					HardEvictionThresholds:   hardEvictionThresholds,
  				},
@@ -67,6 +82,12 @@ index 8ac37d97292..07d67ffbc32 100644
  			},
  			s.FailSwapOn,
  			devicePluginEnabled,
+-			kubeDeps.Recorder)
++			kubeDeps.Recorder,
++			s.NumericTopologyAlignResources)
+ 
+ 		if err != nil {
+ 			return err
 diff --git a/hack/update-generated-resource-plugin-dockerized.sh b/hack/update-generated-resource-plugin-dockerized.sh
 new file mode 100755
 index 00000000000..6a6ec64054b
@@ -161,7 +182,7 @@ index c1a3e6e7f9a..37746f9289c 100644
  	// inherited features from generic apiserver, relisted here to get a conflict if it is changed
  	// unintentionally on either side:
 diff --git a/pkg/generated/openapi/zz_generated.openapi.go b/pkg/generated/openapi/zz_generated.openapi.go
-index b434c316009..9ee9a1cca7f 100644
+index b434c316009..a9e76e44085 100644
 --- a/pkg/generated/openapi/zz_generated.openapi.go
 +++ b/pkg/generated/openapi/zz_generated.openapi.go
 @@ -52942,6 +52942,12 @@ func schema_k8sio_kubelet_config_v1beta1_KubeletConfiguration(ref common.Referen
@@ -177,6 +198,72 @@ index b434c316009..9ee9a1cca7f 100644
  					"topologyManagerScope": {
  						SchemaProps: spec.SchemaProps{
  							Description: "topologyManagerScope represents the scope of topology hint generation that topology manager requests and hint providers generate. Valid values include:\n\n- `container`: topology policy is applied on a per-container basis. - `pod`: topology policy is applied on a per-pod basis.\n\n\"pod\" scope requires the TopologyManager feature gate to be enabled. Default: \"container\"",
+@@ -52949,6 +52955,22 @@ func schema_k8sio_kubelet_config_v1beta1_KubeletConfiguration(ref common.Referen
+ 							Format:      "",
+ 						},
+ 					},
++					"qosResourceManagerResourceNamesMap": {
++						SchemaProps: spec.SchemaProps{
++							Description: "Map of resource name \"A\" to resource name \"B\" during QoS Resource Manager allocation period. It's useful for the same kind resource with different types. (eg. maps best-effort-cpu to cpu) Default: nil",
++							Type:        []string{"object"},
++							AdditionalProperties: &spec.SchemaOrBool{
++								Allows: true,
++								Schema: &spec.Schema{
++									SchemaProps: spec.SchemaProps{
++										Default: "",
++										Type:    []string{"string"},
++										Format:  "",
++									},
++								},
++							},
++						},
++					},
+ 					"qosReserved": {
+ 						SchemaProps: spec.SchemaProps{
+ 							Description: "qosReserved is a set of resource name to percentage pairs that specify the minimum percentage of a resource reserved for exclusive use by the guaranteed QoS tier. Currently supported resources: \"memory\" Requires the QOSReserved feature gate to be enabled. Default: nil",
+@@ -53238,6 +53260,21 @@ func schema_k8sio_kubelet_config_v1beta1_KubeletConfiguration(ref common.Referen
+ 							Format:      "",
+ 						},
+ 					},
++					"numericTopologyAlignResources": {
++						SchemaProps: spec.SchemaProps{
++							Description: "NumericTopologyAlignResources is a list of resources which need to be aligned numa affinity in numeric topology policy. Default: [cpu, memory]",
++							Type:        []string{"array"},
++							Items: &spec.SchemaOrArray{
++								Schema: &spec.Schema{
++									SchemaProps: spec.SchemaProps{
++										Default: "",
++										Type:    []string{"string"},
++										Format:  "",
++									},
++								},
++							},
++						},
++					},
+ 					"systemReserved": {
+ 						SchemaProps: spec.SchemaProps{
+ 							Description: "systemReserved is a set of ResourceName=ResourceQuantity (e.g. cpu=200m,memory=150G) pairs that describe resources reserved for non-kubernetes components. Currently only cpu and memory are supported. See http://kubernetes.io/docs/user-guide/compute-resources for more detail. Default: nil",
+@@ -53454,7 +53491,7 @@ func schema_k8sio_kubelet_config_v1beta1_KubeletConfiguration(ref common.Referen
+ 					},
+ 					"hostPortRange": {
+ 						SchemaProps: spec.SchemaProps{
+-							Description: "HostPortRange specifies the port range reserved for port assignment of autoport pod.",
++							Description: "HostPortRange specifies the port range reserved for port assignment of autoport pod. Default: 9200-9500",
+ 							Default:     map[string]interface{}{},
+ 							Ref:         ref("k8s.io/apimachinery/pkg/util/net.PortRange"),
+ 						},
+diff --git a/pkg/kubelet/apis/config/fuzzer/fuzzer.go b/pkg/kubelet/apis/config/fuzzer/fuzzer.go
+index 5d7ebb9cd58..b19134ac768 100644
+--- a/pkg/kubelet/apis/config/fuzzer/fuzzer.go
++++ b/pkg/kubelet/apis/config/fuzzer/fuzzer.go
+@@ -110,6 +110,7 @@ func Funcs(codecs runtimeserializer.CodecFactory) []interface{} {
+ 			}
+ 			obj.EnableSystemLogHandler = true
+ 			obj.MemoryThrottlingFactor = utilpointer.Float64Ptr(rand.Float64())
++			obj.NumericTopologyAlignResources = []string{"cpu", "memory"}
+ 		},
+ 	}
+ }
 diff --git a/pkg/kubelet/apis/config/helpers_test.go b/pkg/kubelet/apis/config/helpers_test.go
 index 36248e3e369..5876b214cb4 100644
 --- a/pkg/kubelet/apis/config/helpers_test.go
@@ -189,10 +276,20 @@ index 36248e3e369..5876b214cb4 100644
  	)
  )
 diff --git a/pkg/kubelet/apis/config/types.go b/pkg/kubelet/apis/config/types.go
-index 80f317fae58..44ee41ae049 100644
+index 80f317fae58..b8863c03ef3 100644
 --- a/pkg/kubelet/apis/config/types.go
 +++ b/pkg/kubelet/apis/config/types.go
-@@ -232,6 +232,12 @@ type KubeletConfiguration struct {
+@@ -68,6 +68,9 @@ const (
+ 	// SingleNumaNodeTopologyManagerPolicy is a mode in which kubelet only allows
+ 	// pods with a single NUMA alignment of CPU and device resources.
+ 	SingleNumaNodeTopologyManagerPolicy = "single-numa-node"
++	// NumericTopologyManagerPolicy is a mode in which kubelet align resource
++	// with widest NUMAs
++	NumericTopologyManagerPolicy = "numeric"
+ 	// ContainerTopologyManagerScope represents that
+ 	// topology policy is applied on a per-container basis.
+ 	ContainerTopologyManagerScope = "container"
+@@ -232,6 +235,12 @@ type KubeletConfiguration struct {
  	// MemoryManagerPolicy is the name of the policy to use.
  	// Requires the MemoryManager feature gate to be enabled.
  	MemoryManagerPolicy string
@@ -205,8 +302,19 @@ index 80f317fae58..44ee41ae049 100644
  	// TopologyManagerPolicy is the name of the policy to use.
  	// Policies other than "none" require the TopologyManager feature gate to be enabled.
  	TopologyManagerPolicy string
+@@ -350,6 +359,10 @@ type KubeletConfiguration struct {
+ 	// kernelMemcgNotification if enabled, the kubelet will integrate with the kernel memcg
+ 	// notification to determine if memory eviction thresholds are crossed rather than polling.
+ 	KernelMemcgNotification bool
++	// NumericTopologyAlignResources is a list of resources which need to be aligned numa affinity
++	// in numeric topology policy.
++	// +optional
++	NumericTopologyAlignResources []string
+ 
+ 	/* the following fields are meant for Node Allocatable */
+ 
 diff --git a/pkg/kubelet/apis/config/v1beta1/defaults.go b/pkg/kubelet/apis/config/v1beta1/defaults.go
-index cbcdff636d2..05439a11a5d 100644
+index cbcdff636d2..7d97ecc1276 100644
 --- a/pkg/kubelet/apis/config/v1beta1/defaults.go
 +++ b/pkg/kubelet/apis/config/v1beta1/defaults.go
 @@ -163,6 +163,9 @@ func SetDefaults_KubeletConfiguration(obj *kubeletconfigv1beta1.KubeletConfigura
@@ -219,20 +327,39 @@ index cbcdff636d2..05439a11a5d 100644
  	if obj.TopologyManagerPolicy == "" {
  		obj.TopologyManagerPolicy = kubeletconfigv1beta1.NoneTopologyManagerPolicy
  	}
+@@ -243,6 +246,9 @@ func SetDefaults_KubeletConfiguration(obj *kubeletconfigv1beta1.KubeletConfigura
+ 	if obj.EnforceNodeAllocatable == nil {
+ 		obj.EnforceNodeAllocatable = DefaultNodeAllocatableEnforcement
+ 	}
++	if obj.NumericTopologyAlignResources == nil {
++		obj.NumericTopologyAlignResources = []string{"cpu", "memory"}
++	}
+ 	if obj.VolumePluginDir == "" {
+ 		obj.VolumePluginDir = DefaultVolumePluginDir
+ 	}
 diff --git a/pkg/kubelet/apis/config/v1beta1/zz_generated.conversion.go b/pkg/kubelet/apis/config/v1beta1/zz_generated.conversion.go
-index fa65f413e38..3cc0def3aa5 100644
+index fa65f413e38..8518255ee68 100644
 --- a/pkg/kubelet/apis/config/v1beta1/zz_generated.conversion.go
 +++ b/pkg/kubelet/apis/config/v1beta1/zz_generated.conversion.go
-@@ -411,6 +411,8 @@ func autoConvert_v1beta1_KubeletConfiguration_To_config_KubeletConfiguration(in
+@@ -411,7 +411,9 @@ func autoConvert_v1beta1_KubeletConfiguration_To_config_KubeletConfiguration(in
  	out.CPUManagerReconcilePeriod = in.CPUManagerReconcilePeriod
  	out.MemoryManagerPolicy = in.MemoryManagerPolicy
  	out.TopologyManagerPolicy = in.TopologyManagerPolicy
 +	out.QoSResourceManagerReconcilePeriod = in.QoSResourceManagerReconcilePeriod
-+	out.QoSResourceManagerResourceNamesMap = *(*map[string]string)(unsafe.Pointer(&in.QoSResourceManagerResourceNamesMap))
  	out.TopologyManagerScope = in.TopologyManagerScope
++	out.QoSResourceManagerResourceNamesMap = *(*map[string]string)(unsafe.Pointer(&in.QoSResourceManagerResourceNamesMap))
  	out.QOSReserved = *(*map[string]string)(unsafe.Pointer(&in.QOSReserved))
  	out.RuntimeRequestTimeout = in.RuntimeRequestTimeout
-@@ -589,6 +591,8 @@ func autoConvert_config_KubeletConfiguration_To_v1beta1_KubeletConfiguration(in
+ 	out.HairpinMode = in.HairpinMode
+@@ -474,6 +476,7 @@ func autoConvert_v1beta1_KubeletConfiguration_To_config_KubeletConfiguration(in
+ 		return err
+ 	}
+ 	out.ConfigMapAndSecretChangeDetectionStrategy = config.ResourceChangeDetectionStrategy(in.ConfigMapAndSecretChangeDetectionStrategy)
++	out.NumericTopologyAlignResources = *(*[]string)(unsafe.Pointer(&in.NumericTopologyAlignResources))
+ 	out.SystemReserved = *(*map[string]string)(unsafe.Pointer(&in.SystemReserved))
+ 	out.KubeReserved = *(*map[string]string)(unsafe.Pointer(&in.KubeReserved))
+ 	out.ReservedSystemCPUs = in.ReservedSystemCPUs
+@@ -589,6 +592,8 @@ func autoConvert_config_KubeletConfiguration_To_v1beta1_KubeletConfiguration(in
  	out.CPUManagerPolicyOptions = *(*map[string]string)(unsafe.Pointer(&in.CPUManagerPolicyOptions))
  	out.CPUManagerReconcilePeriod = in.CPUManagerReconcilePeriod
  	out.MemoryManagerPolicy = in.MemoryManagerPolicy
@@ -241,8 +368,31 @@ index fa65f413e38..3cc0def3aa5 100644
  	out.TopologyManagerPolicy = in.TopologyManagerPolicy
  	out.TopologyManagerScope = in.TopologyManagerScope
  	out.QOSReserved = *(*map[string]string)(unsafe.Pointer(&in.QOSReserved))
+@@ -655,6 +660,7 @@ func autoConvert_config_KubeletConfiguration_To_v1beta1_KubeletConfiguration(in
+ 	out.ConfigMapAndSecretChangeDetectionStrategy = v1beta1.ResourceChangeDetectionStrategy(in.ConfigMapAndSecretChangeDetectionStrategy)
+ 	out.AllowedUnsafeSysctls = *(*[]string)(unsafe.Pointer(&in.AllowedUnsafeSysctls))
+ 	out.KernelMemcgNotification = in.KernelMemcgNotification
++	out.NumericTopologyAlignResources = *(*[]string)(unsafe.Pointer(&in.NumericTopologyAlignResources))
+ 	out.SystemReserved = *(*map[string]string)(unsafe.Pointer(&in.SystemReserved))
+ 	out.KubeReserved = *(*map[string]string)(unsafe.Pointer(&in.KubeReserved))
+ 	out.SystemReservedCgroup = in.SystemReservedCgroup
+diff --git a/pkg/kubelet/apis/config/validation/validation.go b/pkg/kubelet/apis/config/validation/validation.go
+index 5e38bbfdd01..e639e84b2b9 100644
+--- a/pkg/kubelet/apis/config/validation/validation.go
++++ b/pkg/kubelet/apis/config/validation/validation.go
+@@ -142,8 +142,9 @@ func ValidateKubeletConfiguration(kc *kubeletconfig.KubeletConfiguration) error
+ 	case kubeletconfig.BestEffortTopologyManagerPolicy:
+ 	case kubeletconfig.RestrictedTopologyManagerPolicy:
+ 	case kubeletconfig.SingleNumaNodeTopologyManagerPolicy:
++	case kubeletconfig.NumericTopologyManagerPolicy:
+ 	default:
+-		allErrors = append(allErrors, fmt.Errorf("invalid configuration: topologyManagerPolicy (--topology-manager-policy) %q must be one of: %q", kc.TopologyManagerPolicy, []string{kubeletconfig.NoneTopologyManagerPolicy, kubeletconfig.BestEffortTopologyManagerPolicy, kubeletconfig.RestrictedTopologyManagerPolicy, kubeletconfig.SingleNumaNodeTopologyManagerPolicy}))
++		allErrors = append(allErrors, fmt.Errorf("invalid configuration: topologyManagerPolicy (--topology-manager-policy) %q must be one of: %q", kc.TopologyManagerPolicy, []string{kubeletconfig.NoneTopologyManagerPolicy, kubeletconfig.BestEffortTopologyManagerPolicy, kubeletconfig.RestrictedTopologyManagerPolicy, kubeletconfig.SingleNumaNodeTopologyManagerPolicy, kubeletconfig.NumericTopologyManagerPolicy}))
+ 	}
+ 	if kc.TopologyManagerScope != kubeletconfig.ContainerTopologyManagerScope && !localFeatureGate.Enabled(features.TopologyManager) {
+ 		allErrors = append(allErrors, fmt.Errorf("invalid configuration: topologyManagerScope %v requires feature gate TopologyManager", kc.TopologyManagerScope))
 diff --git a/pkg/kubelet/apis/config/zz_generated.deepcopy.go b/pkg/kubelet/apis/config/zz_generated.deepcopy.go
-index 78c79a3f018..aca05e3403b 100644
+index 78c79a3f018..f460b8b2b0f 100644
 --- a/pkg/kubelet/apis/config/zz_generated.deepcopy.go
 +++ b/pkg/kubelet/apis/config/zz_generated.deepcopy.go
 @@ -210,6 +210,14 @@ func (in *KubeletConfiguration) DeepCopyInto(out *KubeletConfiguration) {
@@ -259,6 +409,18 @@ index 78c79a3f018..aca05e3403b 100644
 +	}
  	if in.QOSReserved != nil {
  		in, out := &in.QOSReserved, &out.QOSReserved
+ 		*out = make(map[string]string, len(*in))
+@@ -261,6 +269,11 @@ func (in *KubeletConfiguration) DeepCopyInto(out *KubeletConfiguration) {
+ 		*out = make([]string, len(*in))
+ 		copy(*out, *in)
+ 	}
++	if in.NumericTopologyAlignResources != nil {
++		in, out := &in.NumericTopologyAlignResources, &out.NumericTopologyAlignResources
++		*out = make([]string, len(*in))
++		copy(*out, *in)
++	}
+ 	if in.SystemReserved != nil {
+ 		in, out := &in.SystemReserved, &out.SystemReserved
  		*out = make(map[string]string, len(*in))
 diff --git a/pkg/kubelet/apis/podresources/server_v1.go b/pkg/kubelet/apis/podresources/server_v1.go
 index 948aa6c9100..8b1a08f2d57 100644
@@ -566,7 +728,7 @@ index e67dbfc3daa..98b13683fbd 100644
  	var respDevs []*podresourcesapi.ContainerDevices
  
 diff --git a/pkg/kubelet/cm/container_manager_linux.go b/pkg/kubelet/cm/container_manager_linux.go
-index 0f09f3eb331..a4751f9ad16 100644
+index 0f09f3eb331..9a7f2bff1bf 100644
 --- a/pkg/kubelet/cm/container_manager_linux.go
 +++ b/pkg/kubelet/cm/container_manager_linux.go
 @@ -46,6 +46,7 @@ import (
@@ -594,7 +756,24 @@ index 0f09f3eb331..a4751f9ad16 100644
  	// Interface for CPU affinity management.
  	cpuManager cpumanager.Manager
  	// Interface for memory affinity management.
-@@ -345,6 +349,18 @@ func NewContainerManager(mountUtil mount.Interface, cadvisorInterface cadvisor.I
+@@ -195,7 +199,7 @@ func validateSystemRequirements(mountUtil mount.Interface) (features, error) {
+ // TODO(vmarmol): Add limits to the system containers.
+ // Takes the absolute name of the specified containers.
+ // Empty container name disables use of the specified container.
+-func NewContainerManager(mountUtil mount.Interface, cadvisorInterface cadvisor.Interface, nodeConfig NodeConfig, failSwapOn bool, devicePluginEnabled bool, recorder record.EventRecorder) (ContainerManager, error) {
++func NewContainerManager(mountUtil mount.Interface, cadvisorInterface cadvisor.Interface, nodeConfig NodeConfig, failSwapOn bool, devicePluginEnabled bool, recorder record.EventRecorder, numericTopologyAlignResources []string) (ContainerManager, error) {
+ 	subsystems, err := GetCgroupSubsystems()
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to get mounted cgroup subsystems: %v", err)
+@@ -289,6 +293,7 @@ func NewContainerManager(mountUtil mount.Interface, cadvisorInterface cadvisor.I
+ 			machineInfo.Topology,
+ 			nodeConfig.ExperimentalTopologyManagerPolicy,
+ 			nodeConfig.ExperimentalTopologyManagerScope,
++			numericTopologyAlignResources,
+ 		)
+ 
+ 		if err != nil {
+@@ -345,6 +350,18 @@ func NewContainerManager(mountUtil mount.Interface, cadvisorInterface cadvisor.I
  		cm.topologyManager.AddHintProvider(cm.memoryManager)
  	}
  
@@ -613,7 +792,7 @@ index 0f09f3eb331..a4751f9ad16 100644
  	return cm, nil
  }
  
-@@ -574,6 +590,13 @@ func (cm *containerManagerImpl) Start(node *v1.Node,
+@@ -574,6 +591,13 @@ func (cm *containerManagerImpl) Start(node *v1.Node,
  		}
  	}
  
@@ -627,7 +806,7 @@ index 0f09f3eb331..a4751f9ad16 100644
  	// cache the node Info including resource capacity and
  	// allocatable of the node
  	cm.nodeInfo = node
-@@ -638,8 +661,11 @@ func (cm *containerManagerImpl) Start(node *v1.Node,
+@@ -638,8 +662,11 @@ func (cm *containerManagerImpl) Start(node *v1.Node,
  	return nil
  }
  
@@ -641,7 +820,7 @@ index 0f09f3eb331..a4751f9ad16 100644
  }
  
  // TODO: move the GetResources logic to PodContainerManager.
-@@ -918,6 +944,10 @@ func (cm *containerManagerImpl) GetCapacity() v1.ResourceList {
+@@ -918,6 +945,10 @@ func (cm *containerManagerImpl) GetCapacity() v1.ResourceList {
  	return cm.capacity
  }
  
@@ -652,7 +831,7 @@ index 0f09f3eb331..a4751f9ad16 100644
  func (cm *containerManagerImpl) GetDevicePluginResourceCapacity() (v1.ResourceList, v1.ResourceList, []string) {
  	return cm.deviceManager.GetCapacity()
  }
-@@ -961,7 +991,8 @@ func (cm *containerManagerImpl) GetAllocatableMemory() []*podresourcesapi.Contai
+@@ -961,7 +992,8 @@ func (cm *containerManagerImpl) GetAllocatableMemory() []*podresourcesapi.Contai
  }
  
  func (cm *containerManagerImpl) ShouldResetExtendedResourceCapacity() bool {
@@ -662,7 +841,7 @@ index 0f09f3eb331..a4751f9ad16 100644
  }
  
  func (cm *containerManagerImpl) UpdateAllocatedDevices() {
-@@ -989,3 +1020,40 @@ func containerMemoryFromBlock(blocks []memorymanagerstate.Block) []*podresources
+@@ -989,3 +1021,40 @@ func containerMemoryFromBlock(blocks []memorymanagerstate.Block) []*podresources
  
  	return containerMemories
  }
@@ -756,6 +935,18 @@ index a5b0e523b13..fccfb4ccdf1 100644
  func NewStubContainerManager() ContainerManager {
  	return &containerManagerStub{shouldResetExtendedResourceCapacity: false}
  }
+diff --git a/pkg/kubelet/cm/container_manager_unsupported.go b/pkg/kubelet/cm/container_manager_unsupported.go
+index 1a0587c36dc..cb1bc6fd5c6 100644
+--- a/pkg/kubelet/cm/container_manager_unsupported.go
++++ b/pkg/kubelet/cm/container_manager_unsupported.go
+@@ -42,6 +42,6 @@ func (unsupportedContainerManager) Start(_ *v1.Node, _ ActivePodsFunc, _ config.
+ 	return fmt.Errorf("Container Manager is unsupported in this build")
+ }
+ 
+-func NewContainerManager(_ mount.Interface, _ cadvisor.Interface, _ NodeConfig, failSwapOn bool, devicePluginEnabled bool, recorder record.EventRecorder) (ContainerManager, error) {
++func NewContainerManager(_ mount.Interface, _ cadvisor.Interface, _ NodeConfig, failSwapOn bool, devicePluginEnabled bool, recorder record.EventRecorder, numericTopologyAlignResources []string) (ContainerManager, error) {
+ 	return &unsupportedContainerManager{}, nil
+ }
 diff --git a/pkg/kubelet/cm/container_manager_windows.go b/pkg/kubelet/cm/container_manager_windows.go
 index ec56fcf2c73..44510e5fc75 100644
 --- a/pkg/kubelet/cm/container_manager_windows.go
@@ -792,6 +983,32 @@ index ec56fcf2c73..44510e5fc75 100644
 +
 +func (cm *containerManagerImpl) UpdateAllocatedResources() {
 +}
+diff --git a/pkg/kubelet/cm/cpumanager/policy_static.go b/pkg/kubelet/cm/cpumanager/policy_static.go
+index a872b389c46..723b35b89d6 100644
+--- a/pkg/kubelet/cm/cpumanager/policy_static.go
++++ b/pkg/kubelet/cm/cpumanager/policy_static.go
+@@ -275,7 +275,7 @@ func (p *staticPolicy) Allocate(s state.State, pod *v1.Pod, container *v1.Contai
+ 		}
+ 
+ 		// Call Topology Manager to get the aligned socket affinity across all hint providers.
+-		hint := p.affinity.GetAffinity(string(pod.UID), container.Name)
++		hint := p.affinity.GetAffinity(string(pod.UID), container.Name, v1.ResourceCPU.String())
+ 		klog.InfoS("Topology Affinity", "pod", klog.KObj(pod), "containerName", container.Name, "affinity", hint)
+ 
+ 		// Allocate CPUs according to the NUMA affinity contained in the hint.
+diff --git a/pkg/kubelet/cm/devicemanager/manager.go b/pkg/kubelet/cm/devicemanager/manager.go
+index b367aa30781..2ecbf946f26 100644
+--- a/pkg/kubelet/cm/devicemanager/manager.go
++++ b/pkg/kubelet/cm/devicemanager/manager.go
+@@ -800,7 +800,7 @@ func (m *ManagerImpl) devicesToAllocate(podUID, contName, resource string, requi
+ 
+ func (m *ManagerImpl) filterByAffinity(podUID, contName, resource string, available sets.String) (sets.String, sets.String, sets.String) {
+ 	// If alignment information is not available, just pass the available list back.
+-	hint := m.topologyAffinityStore.GetAffinity(podUID, contName)
++	hint := m.topologyAffinityStore.GetAffinity(podUID, contName, resource)
+ 	if !m.deviceHasTopologyAlignment(resource) || hint.NUMANodeAffinity == nil {
+ 		return sets.NewString(), sets.NewString(), available
+ 	}
 diff --git a/pkg/kubelet/cm/fake_container_manager.go b/pkg/kubelet/cm/fake_container_manager.go
 index c907301a6d4..f943d0db45e 100644
 --- a/pkg/kubelet/cm/fake_container_manager.go
@@ -840,6 +1057,19 @@ index c907301a6d4..f943d0db45e 100644
  	cm.Lock()
  	defer cm.Unlock()
  	cm.CalledFunctions = append(cm.CalledFunctions, "GetPluginRegistrationHandler")
+diff --git a/pkg/kubelet/cm/memorymanager/policy_static.go b/pkg/kubelet/cm/memorymanager/policy_static.go
+index d1dcd7ba0e8..5948ce84e4e 100644
+--- a/pkg/kubelet/cm/memorymanager/policy_static.go
++++ b/pkg/kubelet/cm/memorymanager/policy_static.go
+@@ -104,7 +104,7 @@ func (p *staticPolicy) Allocate(s state.State, pod *v1.Pod, container *v1.Contai
+ 	}
+ 
+ 	// Call Topology Manager to get the aligned affinity across all hint providers.
+-	hint := p.affinity.GetAffinity(podUID, container.Name)
++	hint := p.affinity.GetAffinity(podUID, container.Name, v1.ResourceMemory.String())
+ 	klog.InfoS("Got topology affinity", "pod", klog.KObj(pod), "podUID", pod.UID, "containerName", container.Name, "hint", hint)
+ 
+ 	requestedResources, err := getRequestedResources(container)
 diff --git a/pkg/kubelet/cm/qosresourcemanager/BUILD b/pkg/kubelet/cm/qosresourcemanager/BUILD
 new file mode 100644
 index 00000000000..89a6e36e86f
@@ -1421,7 +1651,7 @@ index 00000000000..c7f5be9ba13
 +}
 diff --git a/pkg/kubelet/cm/qosresourcemanager/manager.go b/pkg/kubelet/cm/qosresourcemanager/manager.go
 new file mode 100644
-index 00000000000..8fbef63043e
+index 00000000000..9278460f71d
 --- /dev/null
 +++ b/pkg/kubelet/cm/qosresourcemanager/manager.go
 @@ -0,0 +1,1261 @@
@@ -1922,7 +2152,7 @@ index 00000000000..8fbef63043e
 +		}
 +
 +		if m.resourceHasTopologyAlignment(resource) {
-+			hint := m.topologyAffinityStore.GetAffinity(podUID, contName)
++			hint := m.topologyAffinityStore.GetAffinity(podUID, contName, resource)
 +
 +			if hint.NUMANodeAffinity == nil {
 +				klog.Warningf("[qosresourcemanager] pod: %s/%s; container: %s allocate resouce: %s without numa nodes affinity",
@@ -5869,6 +6099,2316 @@ index 00000000000..879aa6eea4e
 +
 +	return pod.Annotations[pluginapi.KatalystSkipQRMAdmitAnnotationKey] == pluginapi.KatalystValueTrue
 +}
+diff --git a/pkg/kubelet/cm/topologymanager/fake_topology_manager.go b/pkg/kubelet/cm/topologymanager/fake_topology_manager.go
+index 8a60aa23347..a65ba2fe427 100644
+--- a/pkg/kubelet/cm/topologymanager/fake_topology_manager.go
++++ b/pkg/kubelet/cm/topologymanager/fake_topology_manager.go
+@@ -41,8 +41,8 @@ func NewFakeManagerWithHint(hint *TopologyHint) Manager {
+ 	}
+ }
+ 
+-func (m *fakeManager) GetAffinity(podUID string, containerName string) TopologyHint {
+-	klog.InfoS("GetAffinity", "podUID", podUID, "containerName", containerName)
++func (m *fakeManager) GetAffinity(podUID string, containerName string, resourceName string) TopologyHint {
++	klog.InfoS("GetAffinity", "podUID", podUID, "containerName", containerName, "resourceName", resourceName)
+ 	if m.hint == nil {
+ 		return TopologyHint{}
+ 	}
+diff --git a/pkg/kubelet/cm/topologymanager/fake_topology_manager_test.go b/pkg/kubelet/cm/topologymanager/fake_topology_manager_test.go
+index 517b2650712..2e0c14c3fd2 100644
+--- a/pkg/kubelet/cm/topologymanager/fake_topology_manager_test.go
++++ b/pkg/kubelet/cm/topologymanager/fake_topology_manager_test.go
+@@ -49,7 +49,7 @@ func TestFakeGetAffinity(t *testing.T) {
+ 	}
+ 	for _, tc := range tcases {
+ 		fm := fakeManager{}
+-		actual := fm.GetAffinity(tc.podUID, tc.containerName)
++		actual := fm.GetAffinity(tc.podUID, tc.containerName, defaultResourceKey)
+ 		if !reflect.DeepEqual(actual, tc.expected) {
+ 			t.Errorf("Expected Affinity in result to be %v, got %v", tc.expected, actual)
+ 		}
+diff --git a/pkg/kubelet/cm/topologymanager/policy.go b/pkg/kubelet/cm/topologymanager/policy.go
+index 40255ed95cc..d1643e17687 100644
+--- a/pkg/kubelet/cm/topologymanager/policy.go
++++ b/pkg/kubelet/cm/topologymanager/policy.go
+@@ -27,7 +27,7 @@ type Policy interface {
+ 	Name() string
+ 	// Returns a merged TopologyHint based on input from hint providers
+ 	// and a Pod Admit Handler Response based on hints and policy type
+-	Merge(providersHints []map[string][]TopologyHint) (TopologyHint, bool)
++	Merge(providersHints []map[string][]TopologyHint) (map[string]TopologyHint, bool)
+ }
+ 
+ // Merge a TopologyHints permutation to a single hint by performing a bitwise-AND
+@@ -61,21 +61,28 @@ func mergePermutation(numaNodes []int, permutation []TopologyHint) TopologyHint
+ 	return TopologyHint{mergedAffinity, preferred}
+ }
+ 
+-func filterProvidersHints(providersHints []map[string][]TopologyHint) [][]TopologyHint {
++func filterProvidersHints(providersHints []map[string][]TopologyHint) ([][]TopologyHint, []string) {
+ 	// Loop through all hint providers and save an accumulated list of the
+ 	// hints returned by each hint provider. If no hints are provided, assume
+ 	// that provider has no preference for topology-aware allocation.
+-	var allProviderHints [][]TopologyHint
++	var (
++		allProviderHints [][]TopologyHint
++		resourceNames    []string
++	)
+ 	for _, hints := range providersHints {
+ 		// If hints is nil, insert a single, preferred any-numa hint into allProviderHints.
+ 		if len(hints) == 0 {
+ 			klog.InfoS("Hint Provider has no preference for NUMA affinity with any resource")
+ 			allProviderHints = append(allProviderHints, []TopologyHint{{nil, true}})
++			// Here, we add a defaultResourceKey to resourceNames because we don't know
++			// which resource this hint is for.
++			resourceNames = append(resourceNames, defaultResourceKey)
+ 			continue
+ 		}
+ 
+ 		// Otherwise, accumulate the hints for each resource type into allProviderHints.
+ 		for resource := range hints {
++			resourceNames = append(resourceNames, resource)
+ 			if hints[resource] == nil {
+ 				klog.InfoS("Hint Provider has no preference for NUMA affinity with resource", "resource", resource)
+ 				allProviderHints = append(allProviderHints, []TopologyHint{{nil, true}})
+@@ -91,7 +98,7 @@ func filterProvidersHints(providersHints []map[string][]TopologyHint) [][]Topolo
+ 			allProviderHints = append(allProviderHints, hints[resource])
+ 		}
+ 	}
+-	return allProviderHints
++	return allProviderHints, resourceNames
+ }
+ 
+ func narrowestHint(hints []TopologyHint) *TopologyHint {
+@@ -323,3 +330,18 @@ func iterateAllProviderTopologyHints(allProviderHints [][]TopologyHint, callback
+ 	}
+ 	iterate(0, []TopologyHint{})
+ }
++
++// generateResourceHints generates the map from resourceName to given hint.
++// all providers get a same bestHint under native policy(None,best_effort,restricted,single_numa_node),
++// we just map resources to the bestHint
++func generateResourceHints(resourceNames []string, hint TopologyHint) map[string]TopologyHint {
++	result := make(map[string]TopologyHint)
++	for _, resource := range resourceNames {
++		result[resource] = hint
++	}
++	// If non resourceNames are provided, we add defaultResourceKey here.
++	if len(resourceNames) == 0 {
++		result[defaultResourceKey] = hint
++	}
++	return result
++}
+diff --git a/pkg/kubelet/cm/topologymanager/policy_best_effort.go b/pkg/kubelet/cm/topologymanager/policy_best_effort.go
+index 651f3a76572..d35c2525e64 100644
+--- a/pkg/kubelet/cm/topologymanager/policy_best_effort.go
++++ b/pkg/kubelet/cm/topologymanager/policy_best_effort.go
+@@ -39,9 +39,9 @@ func (p *bestEffortPolicy) canAdmitPodResult(hint *TopologyHint) bool {
+ 	return true
+ }
+ 
+-func (p *bestEffortPolicy) Merge(providersHints []map[string][]TopologyHint) (TopologyHint, bool) {
+-	filteredProvidersHints := filterProvidersHints(providersHints)
++func (p *bestEffortPolicy) Merge(providersHints []map[string][]TopologyHint) (map[string]TopologyHint, bool) {
++	filteredProvidersHints, resourceNames := filterProvidersHints(providersHints)
+ 	bestHint := mergeFilteredHints(p.numaNodes, filteredProvidersHints)
+ 	admit := p.canAdmitPodResult(&bestHint)
+-	return bestHint, admit
++	return generateResourceHints(resourceNames, bestHint), admit
+ }
+diff --git a/pkg/kubelet/cm/topologymanager/policy_none.go b/pkg/kubelet/cm/topologymanager/policy_none.go
+index 271f9dde79b..9d9ecfd0a30 100644
+--- a/pkg/kubelet/cm/topologymanager/policy_none.go
++++ b/pkg/kubelet/cm/topologymanager/policy_none.go
+@@ -36,6 +36,6 @@ func (p *nonePolicy) canAdmitPodResult(hint *TopologyHint) bool {
+ 	return true
+ }
+ 
+-func (p *nonePolicy) Merge(providersHints []map[string][]TopologyHint) (TopologyHint, bool) {
+-	return TopologyHint{}, p.canAdmitPodResult(nil)
++func (p *nonePolicy) Merge(providersHints []map[string][]TopologyHint) (map[string]TopologyHint, bool) {
++	return map[string]TopologyHint{}, p.canAdmitPodResult(nil)
+ }
+diff --git a/pkg/kubelet/cm/topologymanager/policy_none_test.go b/pkg/kubelet/cm/topologymanager/policy_none_test.go
+index 5ce33039bd2..b5221a3a5fa 100644
+--- a/pkg/kubelet/cm/topologymanager/policy_none_test.go
++++ b/pkg/kubelet/cm/topologymanager/policy_none_test.go
+@@ -70,13 +70,13 @@ func TestPolicyNoneMerge(t *testing.T) {
+ 	tcases := []struct {
+ 		name           string
+ 		providersHints []map[string][]TopologyHint
+-		expectedHint   TopologyHint
++		expectedHint   map[string]TopologyHint
+ 		expectedAdmit  bool
+ 	}{
+ 		{
+ 			name:           "merged empty providers hints",
+ 			providersHints: []map[string][]TopologyHint{},
+-			expectedHint:   TopologyHint{},
++			expectedHint:   map[string]TopologyHint{},
+ 			expectedAdmit:  true,
+ 		},
+ 		{
+@@ -86,7 +86,7 @@ func TestPolicyNoneMerge(t *testing.T) {
+ 					"resource": {{NUMANodeAffinity: NewTestBitMask(0, 1), Preferred: true}},
+ 				},
+ 			},
+-			expectedHint:  TopologyHint{},
++			expectedHint:  map[string]TopologyHint{},
+ 			expectedAdmit: true,
+ 		},
+ 		{
+@@ -96,7 +96,7 @@ func TestPolicyNoneMerge(t *testing.T) {
+ 					"resource": {{NUMANodeAffinity: NewTestBitMask(0, 1), Preferred: false}},
+ 				},
+ 			},
+-			expectedHint:  TopologyHint{},
++			expectedHint:  map[string]TopologyHint{},
+ 			expectedAdmit: true,
+ 		},
+ 	}
+@@ -104,7 +104,13 @@ func TestPolicyNoneMerge(t *testing.T) {
+ 	for _, tc := range tcases {
+ 		policy := NewNonePolicy()
+ 		result, admit := policy.Merge(tc.providersHints)
+-		if !result.IsEqual(tc.expectedHint) || admit != tc.expectedAdmit {
++		for resource, hint := range result {
++			expected := tc.expectedHint[resource]
++			if !hint.IsEqual(expected) {
++				t.Errorf("Test Case: %s: Expected merge hint to be %v, got %v", tc.name, tc.expectedHint, result)
++			}
++		}
++		if admit != tc.expectedAdmit {
+ 			t.Errorf("Test Case: %s: Expected merge hint to be %v, got %v", tc.name, tc.expectedHint, result)
+ 		}
+ 	}
+diff --git a/pkg/kubelet/cm/topologymanager/policy_numeric.go b/pkg/kubelet/cm/topologymanager/policy_numeric.go
+new file mode 100644
+index 00000000000..a0eb3c4f479
+--- /dev/null
++++ b/pkg/kubelet/cm/topologymanager/policy_numeric.go
+@@ -0,0 +1,236 @@
++package topologymanager
++
++import (
++	v1 "k8s.io/api/core/v1"
++	"k8s.io/klog/v2"
++	"k8s.io/kubernetes/pkg/kubelet/cm/topologymanager/bitmask"
++	"sort"
++)
++
++// numericPolicy implements a policy:
++// 1. for align resources, hints should be totally equal and at-least-one preferred.
++// 2. for other resources, bigger hints always contains smaller hints.
++// 3. more preferredHint count hints permutation is preferred.
++// 4. smaller maxNumaCount hints permutation is preferred.
++type numericPolicy struct {
++	// alignResourceNames are those resources which should be aligned in numa node.
++	alignResourceNames []string
++}
++
++// PolicyNumeric policy name.
++const PolicyNumeric string = "numeric"
++
++var defaultAlignResourceNames = []string{v1.ResourceCPU.String(), v1.ResourceMemory.String()}
++
++// NewNumericPolicy returns numeric policy.
++func NewNumericPolicy(alignResourceNames []string) Policy {
++	if alignResourceNames == nil {
++		alignResourceNames = defaultAlignResourceNames
++	}
++	return &numericPolicy{
++		alignResourceNames: alignResourceNames,
++	}
++}
++
++// Name returns numericPolicy name
++func (p *numericPolicy) Name() string {
++	return PolicyNumeric
++}
++
++func (p *numericPolicy) Merge(providersHints []map[string][]TopologyHint) (map[string]TopologyHint, bool) {
++	if len(providersHints) == 0 {
++		return map[string]TopologyHint{
++			defaultResourceKey: {nil, true},
++		}, true
++	}
++
++	if existEmptyHintSlice(providersHints) {
++		klog.Infof("[topologymanager.numeric_policy] admit failed due to existing empty hint slice")
++		return nil, false
++	}
++
++	filteredHints, resourceNames := filterProvidersHints(providersHints)
++
++	bestHints := findBestNumericPermutation(filteredHints, getAlignResourceIndexes(resourceNames, p.alignResourceNames))
++	// no permutation fits the policy
++	if bestHints == nil {
++		return nil, false
++	}
++
++	if len(bestHints) != len(resourceNames) {
++		// This should not happen.
++		klog.Warningf("[numeric policy] wrong hints length %d vs resource length %d", len(bestHints), len(resourceNames))
++		return nil, false
++	}
++
++	result := make(map[string]TopologyHint)
++	for i := range resourceNames {
++		result[resourceNames[i]] = bestHints[i]
++	}
++	return result, true
++}
++
++// findBestNumericPermutation finds the best numeric permutation.
++func findBestNumericPermutation(filteredHints [][]TopologyHint, alignResourceIndexes []int) []TopologyHint {
++	var bestHints []TopologyHint
++
++	iterateAllProviderTopologyHints(filteredHints, func(permutation []TopologyHint) {
++		// the length of permutation and the order of the resources hints in it are equal to filteredHints,
++		// align and unaligned resource hints can be filtered by alignResourceIndexes
++
++		// 1. check if align resource hints are equal,
++		// and there should be at least one preferred hint.
++		var alignHasPreferred bool
++		for i := 0; i < len(alignResourceIndexes)-1; i++ {
++			cur := alignResourceIndexes[i]
++			next := alignResourceIndexes[i+1]
++
++			if !numaAffinityAligned(permutation[cur], permutation[next]) {
++				// hints are not aligned
++				return
++			}
++			alignHasPreferred = permutation[cur].Preferred || permutation[next].Preferred
++		}
++		if len(alignResourceIndexes) == 1 {
++			alignHasPreferred = permutation[alignResourceIndexes[0]].Preferred
++		}
++		if len(alignResourceIndexes) > 0 && !alignHasPreferred {
++			// all hints are not preferred
++			return
++		}
++
++		// 2. check if bigger numa-node hints contains smaller numa-node hints.
++		if !isSubsetPermutation(permutation) {
++			return
++		}
++
++		if bestHints == nil {
++			bestHints = DeepCopyTopologyHints(permutation)
++		}
++
++		// 3. If preferredHint count beside align resources in this permutation is larger than
++		// that in current bestHints, always choose more preferredHint permutation.
++		if preferredCountBesideAlign(permutation, alignResourceIndexes) >
++			preferredCountBesideAlign(bestHints, alignResourceIndexes) {
++			bestHints = DeepCopyTopologyHints(permutation)
++			return
++		}
++
++		// 4. Only Consider permutation that have smaller maxNumaCount than the
++		// maxNumaCount in the current bestHint.
++		if getMaxNumaCount(permutation) < getMaxNumaCount(bestHints) {
++			bestHints = DeepCopyTopologyHints(permutation)
++			return
++		}
++	})
++
++	return bestHints
++}
++
++// isSubsetPermutation checks whether permutation meets that bigger numa-node hints always
++// contain smaller numa-node hints or not.
++func isSubsetPermutation(permutation []TopologyHint) bool {
++	// When NUMANodeAffinity is nil,  means this has no preference.
++	// We should ignore it.
++	var filters []TopologyHint
++	for _, hint := range permutation {
++		if hint.NUMANodeAffinity != nil {
++			filters = append(filters, hint)
++		}
++	}
++
++	// Sort from small numa node count to big count.
++	sort.Slice(filters, func(i, j int) bool {
++		return filters[i].NUMANodeAffinity.Count() <= filters[j].NUMANodeAffinity.Count()
++	})
++
++	for i := 0; i < len(filters)-1; i++ {
++		cur := filters[i]
++		next := filters[i+1]
++		if !bitmask.And(next.NUMANodeAffinity, cur.NUMANodeAffinity).IsEqual(cur.NUMANodeAffinity) {
++			return false
++		}
++	}
++
++	return true
++}
++
++// getMaxNumaCount returns the max numa count in the given hints.
++func getMaxNumaCount(permutation []TopologyHint) int {
++	var result int
++	for _, hint := range permutation {
++		if hint.NUMANodeAffinity == nil {
++			continue
++		}
++		if hint.NUMANodeAffinity.Count() > result {
++			result = hint.NUMANodeAffinity.Count()
++		}
++	}
++	return result
++}
++
++// preferredCountBesideAlign counts the preferred hints beside align resources.
++func preferredCountBesideAlign(hints []TopologyHint, alignIndexes []int) int {
++	var result int
++	alignIndexesMap := map[int]bool{}
++	for _, index := range alignIndexes {
++		alignIndexesMap[index] = true
++	}
++	for i, hint := range hints {
++		if _, ok := alignIndexesMap[i]; ok {
++			continue
++		}
++		if hint.Preferred {
++			result++
++		}
++	}
++	return result
++}
++
++// numaAffinityAligned checks a,b TopologyHint could be aligned or not.
++func numaAffinityAligned(a, b TopologyHint) bool {
++	if a.NUMANodeAffinity == nil && b.NUMANodeAffinity == nil {
++		return a.Preferred == b.Preferred
++	} else if a.NUMANodeAffinity == nil { // b.NUMANodeAffinity != nil
++		// if a.Preferred, there is no NUMA preference for a, so it can be aligned with b.
++		return a.Preferred
++	} else if b.NUMANodeAffinity == nil { // a.NUMANodeAffinity != nil
++		// if b.Preferred, there is no NUMA preference for b, so it can be aligned with a.
++		return b.Preferred
++	}
++
++	// NUMANodeAffinity of alignResources should be totally equal
++	return a.NUMANodeAffinity.IsEqual(b.NUMANodeAffinity)
++}
++
++// getAlignResourceIndexes gets align resource indexes in resources array.
++func getAlignResourceIndexes(resources []string, alignResourceNames []string) []int {
++	resourceIndexes := make(map[string]int)
++	for i, rn := range resources {
++		resourceIndexes[rn] = i
++	}
++	var result []int
++	for _, align := range alignResourceNames {
++		index, ok := resourceIndexes[align]
++		if ok {
++			result = append(result, index)
++		}
++	}
++	return result
++}
++
++// existEmptyHintSlice returns true if there is empty hint slice in providersHints
++func existEmptyHintSlice(providersHints []map[string][]TopologyHint) bool {
++	for _, hints := range providersHints {
++		for resource := range hints {
++			// hint providers return nil if there is no possible NUMA affinity for resource
++			// hint providers return empty slice if there is no preference NUMA affinity for resource
++			if hints[resource] != nil && len(hints[resource]) == 0 {
++				klog.Infof("[topology_manager.numeric_policy] hint Provider has no possible NUMA affinitiy for resource: %s", resource)
++				return true
++			}
++		}
++	}
++
++	return false
++}
+diff --git a/pkg/kubelet/cm/topologymanager/policy_numeric_test.go b/pkg/kubelet/cm/topologymanager/policy_numeric_test.go
+new file mode 100644
+index 00000000000..3792851a657
+--- /dev/null
++++ b/pkg/kubelet/cm/topologymanager/policy_numeric_test.go
+@@ -0,0 +1,893 @@
++package topologymanager
++
++import "testing"
++
++func TestPolicyNumericMerge(t *testing.T) {
++	policy := NewNumericPolicy(defaultAlignResourceNames)
++
++	tcases := []policyMergeTestCase{
++		{
++			name: "Two providers, 1 hint each, same mask, both preferred 1/2",
++			hp: []HintProvider{
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"resource1": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0),
++								Preferred:        true,
++							},
++						},
++					},
++				},
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"resource2": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0),
++								Preferred:        true,
++							},
++						},
++					},
++				},
++			},
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        true,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        true,
++				},
++			},
++		},
++		{
++			name: "Two providers, 1 hint each, same mask, both preferred 2/2",
++			hp: []HintProvider{
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"resource1": {
++							{
++								NUMANodeAffinity: NewTestBitMask(1),
++								Preferred:        true,
++							},
++						},
++					},
++				},
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"resource2": {
++							{
++								NUMANodeAffinity: NewTestBitMask(1),
++								Preferred:        true,
++							},
++						},
++					},
++				},
++			},
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(1),
++					Preferred:        true,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(1),
++					Preferred:        true,
++				},
++			},
++		},
++		{
++			name: "Two providers, 1 no hints, 1 single hint preferred 1/2",
++			hp: []HintProvider{
++				&mockHintProvider{},
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"resource": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0),
++								Preferred:        true,
++							},
++						},
++					},
++				},
++			},
++			expected: map[string]TopologyHint{
++				"resource": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        true,
++				},
++				defaultResourceKey: {
++					NUMANodeAffinity: nil,
++					Preferred:        true,
++				},
++			},
++		},
++		{
++			name: "Two providers, 1 no hints, 1 single hint preferred 2/2",
++			hp: []HintProvider{
++				&mockHintProvider{},
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"resource": {
++							{
++								NUMANodeAffinity: NewTestBitMask(1),
++								Preferred:        true,
++							},
++						},
++					},
++				},
++			},
++			expected: map[string]TopologyHint{
++				"resource": {
++					NUMANodeAffinity: NewTestBitMask(1),
++					Preferred:        true,
++				},
++				defaultResourceKey: {
++					NUMANodeAffinity: nil,
++					Preferred:        true,
++				},
++			},
++		},
++		{
++			name: "Two providers, 1 with 2 hints, 1 with single hint matching 1/2",
++			hp: []HintProvider{
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"resource1": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0),
++								Preferred:        true,
++							},
++							{
++								NUMANodeAffinity: NewTestBitMask(1),
++								Preferred:        true,
++							},
++						},
++					},
++				},
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"resource2": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0),
++								Preferred:        true,
++							},
++						},
++					},
++				},
++			},
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        true,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        true,
++				},
++			},
++		},
++
++		{
++			name: "Two providers, 1 with 2 hints, 1 with single hint matching 2/2",
++			hp: []HintProvider{
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"resource1": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0),
++								Preferred:        true,
++							},
++							{
++								NUMANodeAffinity: NewTestBitMask(1),
++								Preferred:        true,
++							},
++						},
++					},
++				},
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"resource2": {
++							{
++								NUMANodeAffinity: NewTestBitMask(1),
++								Preferred:        true,
++							},
++						},
++					},
++				},
++			},
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(1),
++					Preferred:        true,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(1),
++					Preferred:        true,
++				},
++			},
++		},
++		{
++			name: "Two providers, both with 2 hints, matching narrower preferred hint from both",
++			hp: []HintProvider{
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"resource1": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0),
++								Preferred:        true,
++							},
++							{
++								NUMANodeAffinity: NewTestBitMask(1),
++								Preferred:        true,
++							},
++						},
++					},
++				},
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"resource2": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0),
++								Preferred:        true,
++							},
++							{
++								NUMANodeAffinity: NewTestBitMask(0, 1),
++								Preferred:        false,
++							},
++						},
++					},
++				},
++			},
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        true,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        true,
++				},
++			},
++		},
++		{
++			name: "Ensure less narrow preferred hints are chosen over narrower non-preferred hints",
++			hp: []HintProvider{
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"resource1": {
++							{
++								NUMANodeAffinity: NewTestBitMask(1),
++								Preferred:        true,
++							},
++							{
++								NUMANodeAffinity: NewTestBitMask(0, 1),
++								Preferred:        false,
++							},
++						},
++					},
++				},
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"resource2": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0),
++								Preferred:        true,
++							},
++							{
++								NUMANodeAffinity: NewTestBitMask(1),
++								Preferred:        true,
++							},
++							{
++								NUMANodeAffinity: NewTestBitMask(0, 1),
++								Preferred:        false,
++							},
++						},
++					},
++				},
++			},
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(1),
++					Preferred:        true,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(1),
++					Preferred:        true,
++				},
++			},
++		},
++		{
++			name: "Multiple resources, same provider",
++			hp: []HintProvider{
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"resource1": {
++							{
++								NUMANodeAffinity: NewTestBitMask(1),
++								Preferred:        true,
++							},
++							{
++								NUMANodeAffinity: NewTestBitMask(0, 1),
++								Preferred:        false,
++							},
++						},
++						"resource2": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0),
++								Preferred:        true,
++							},
++							{
++								NUMANodeAffinity: NewTestBitMask(1),
++								Preferred:        true,
++							},
++							{
++								NUMANodeAffinity: NewTestBitMask(0, 1),
++								Preferred:        false,
++							},
++						},
++					},
++				},
++			},
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(1),
++					Preferred:        true,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(1),
++					Preferred:        true,
++				},
++			},
++		},
++		{
++			name: "TopologyHint not set",
++			hp:   []HintProvider{},
++			expected: map[string]TopologyHint{
++				defaultResourceKey: {
++					NUMANodeAffinity: nil,
++					Preferred:        true,
++				},
++			},
++		},
++		{
++			name: "HintProvider returns empty non-nil map[string][]TopologyHint",
++			hp: []HintProvider{
++				&mockHintProvider{
++					map[string][]TopologyHint{},
++				},
++			},
++			expected: map[string]TopologyHint{
++				defaultResourceKey: {
++					NUMANodeAffinity: nil,
++					Preferred:        true,
++				},
++			},
++		},
++		{
++			name: "HintProvider returns -nil map[string][]TopologyHint from provider",
++			hp: []HintProvider{
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"resource": nil,
++					},
++				},
++			},
++			expected: map[string]TopologyHint{
++				"resource": {
++					NUMANodeAffinity: nil,
++					Preferred:        true,
++				},
++			},
++		},
++		{
++			name: "HintProvider returns empty non-nil map[string][]TopologyHint from provider",
++			hp: []HintProvider{
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"resource": {},
++					},
++				},
++			},
++			expected: nil,
++		},
++		{
++			name: "Single TopologyHint with Preferred as true and NUMANodeAffinity as nil",
++			hp: []HintProvider{
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"resource": {
++							{
++								NUMANodeAffinity: nil,
++								Preferred:        true,
++							},
++						},
++					},
++				},
++			},
++			expected: map[string]TopologyHint{
++				"resource": {
++					NUMANodeAffinity: nil,
++					Preferred:        true,
++				},
++			},
++		},
++		{
++			name: "Two providers, 1 hint each, no common mask",
++			hp: []HintProvider{
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"resource1": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0),
++								Preferred:        true,
++							},
++						},
++					},
++				},
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"resource2": {
++							{
++								NUMANodeAffinity: NewTestBitMask(1),
++								Preferred:        true,
++							},
++						},
++					},
++				},
++			},
++			expected: nil,
++		},
++		{
++			name: "Two providers, 1 hint each, same mask, 1 preferred, 1 not 1/2",
++			hp: []HintProvider{
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"resource1": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0),
++								Preferred:        true,
++							},
++						},
++					},
++				},
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"resource2": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0),
++								Preferred:        false,
++							},
++						},
++					},
++				},
++			},
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        true,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        false,
++				},
++			},
++		},
++		{
++			name: "Two providers, 1 hint each, same mask, 1 preferred, 1 not 2/2",
++			hp: []HintProvider{
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"resource1": {
++							{
++								NUMANodeAffinity: NewTestBitMask(1),
++								Preferred:        true,
++							},
++						},
++					},
++				},
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"resource2": {
++							{
++								NUMANodeAffinity: NewTestBitMask(1),
++								Preferred:        false,
++							},
++						},
++					},
++				},
++			},
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(1),
++					Preferred:        true,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(1),
++					Preferred:        false,
++				},
++			},
++		},
++		{
++			name: "Two providers, 1 with 2 hints, 1 with single non-preferred hint matching",
++			hp: []HintProvider{
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"resource1": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0),
++								Preferred:        true,
++							},
++							{
++								NUMANodeAffinity: NewTestBitMask(1),
++								Preferred:        true,
++							},
++						},
++					},
++				},
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"resource2": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0, 1),
++								Preferred:        false,
++							},
++						},
++					},
++				},
++			},
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        true,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(0, 1),
++					Preferred:        false,
++				},
++			},
++		},
++		{
++			name: "Numeric hint generation, two resource",
++			hp: []HintProvider{
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"resource1": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0, 1),
++								Preferred:        true,
++							},
++						},
++						"resource2": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0),
++								Preferred:        true,
++							},
++							{
++								NUMANodeAffinity: NewTestBitMask(1),
++								Preferred:        true,
++							},
++							{
++								NUMANodeAffinity: NewTestBitMask(0, 1),
++								Preferred:        false,
++							},
++						},
++					},
++				},
++			},
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(0, 1),
++					Preferred:        true,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        true,
++				},
++			},
++		},
++		{
++			name: "Align cpu, memory, cpu with 2/2 hit, memory with 1/2, 2/2 hint",
++			hp: []HintProvider{
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"cpu": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0, 1),
++								Preferred:        true,
++							},
++						},
++						"memory": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0),
++								Preferred:        true,
++							},
++							{
++								NUMANodeAffinity: NewTestBitMask(1),
++								Preferred:        true,
++							},
++							{
++								NUMANodeAffinity: NewTestBitMask(0, 1),
++								Preferred:        false,
++							},
++						},
++						"gpu": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0),
++								Preferred:        true,
++							},
++						},
++					},
++				},
++			},
++			expected: map[string]TopologyHint{
++				"cpu": {
++					NUMANodeAffinity: NewTestBitMask(0, 1),
++					Preferred:        true,
++				},
++				"memory": {
++					NUMANodeAffinity: NewTestBitMask(0, 1),
++					Preferred:        false,
++				},
++				"gpu": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        true,
++				},
++			},
++		},
++		{
++			name: "Align cpu, memory, cpu with 2/2 hit, memory with 1/2, 2/2 hint",
++			hp: []HintProvider{
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"cpu": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0, 1),
++								Preferred:        true,
++							},
++						},
++						"memory": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0),
++								Preferred:        true,
++							},
++							{
++								NUMANodeAffinity: NewTestBitMask(1),
++								Preferred:        true,
++							},
++						},
++						"gpu": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0),
++								Preferred:        true,
++							},
++						},
++					},
++				},
++			},
++			expected: nil,
++		},
++		{
++			name: "Align cpu, cpu with 2/2 hit",
++			hp: []HintProvider{
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"cpu": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0, 1),
++								Preferred:        false,
++							},
++						},
++						"gpu": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0),
++								Preferred:        true,
++							},
++						},
++					},
++				},
++			},
++			expected: nil,
++		},
++		{
++			name: "Align cpu, cpu with 1/2, 2/2 hit",
++			hp: []HintProvider{
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"cpu": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0, 1),
++								Preferred:        false,
++							},
++							{
++								NUMANodeAffinity: NewTestBitMask(0),
++								Preferred:        true,
++							},
++						},
++						"gpu": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0),
++								Preferred:        false,
++							},
++						},
++					},
++				},
++			},
++			expected: map[string]TopologyHint{
++				"cpu": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        true,
++				},
++				"gpu": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        false,
++				},
++			},
++		},
++		{
++			name: "Align cpu, cpu with 1/2 hit, gpu with 1/2, 2/2 hint",
++			hp: []HintProvider{
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"cpu": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0),
++								Preferred:        true,
++							},
++						},
++						"gpu": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0, 1),
++								Preferred:        false,
++							},
++							{
++								NUMANodeAffinity: NewTestBitMask(0),
++								Preferred:        true,
++							},
++						},
++					},
++				},
++			},
++			expected: map[string]TopologyHint{
++				"cpu": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        true,
++				},
++				"gpu": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        true,
++				},
++			},
++		},
++		{
++			name: "Align cpu, memory, cpu with 2/2 hit, memory with 1/2, 2/2 hint",
++			hp: []HintProvider{
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"gpu": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0, 1),
++								Preferred:        false,
++							},
++							{
++								NUMANodeAffinity: NewTestBitMask(0),
++								Preferred:        true,
++							},
++						},
++						"cpu": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0, 1),
++								Preferred:        true,
++							},
++						},
++						"memory": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0),
++								Preferred:        true,
++							},
++							{
++								NUMANodeAffinity: NewTestBitMask(1),
++								Preferred:        true,
++							},
++							{
++								NUMANodeAffinity: NewTestBitMask(0, 1),
++								Preferred:        false,
++							},
++						},
++					},
++				},
++			},
++			expected: map[string]TopologyHint{
++				"cpu": {
++					NUMANodeAffinity: NewTestBitMask(0, 1),
++					Preferred:        true,
++				},
++				"memory": {
++					NUMANodeAffinity: NewTestBitMask(0, 1),
++					Preferred:        false,
++				},
++				"gpu": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        true,
++				},
++			},
++		},
++		{
++			name: "Align cpu, memory, nil, nil provider to test append bug",
++			hp: []HintProvider{
++				&mockHintProvider{},
++				&mockHintProvider{},
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"cpu": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0),
++								Preferred:        true,
++							},
++							{
++								NUMANodeAffinity: NewTestBitMask(1),
++								Preferred:        true,
++							},
++						},
++						"memory": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0),
++								Preferred:        true,
++							},
++							{
++								NUMANodeAffinity: NewTestBitMask(1),
++								Preferred:        true,
++							},
++						},
++					},
++				},
++			},
++			expected: map[string]TopologyHint{
++				defaultResourceKey: {
++					NUMANodeAffinity: nil,
++					Preferred:        true,
++				},
++				"cpu": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        true,
++				},
++				"memory": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        true,
++				},
++			},
++		},
++		{
++			name: "Align cpu, memory. cpu nil preferred nil hint, memory with 2/2 hint",
++			hp: []HintProvider{
++				&mockHintProvider{
++					map[string][]TopologyHint{
++						"memory": {
++							{
++								NUMANodeAffinity: NewTestBitMask(0, 1),
++								Preferred:        true,
++							},
++						},
++						"cpu": {
++							{
++								NUMANodeAffinity: nil,
++								Preferred:        true,
++							},
++						},
++					},
++				},
++			},
++			expected: map[string]TopologyHint{
++				"memory": {
++					NUMANodeAffinity: NewTestBitMask(0, 1),
++					Preferred:        true,
++				},
++				"cpu": {
++					NUMANodeAffinity: nil,
++					Preferred:        true,
++				},
++			},
++		},
++	}
++	testPolicyMerge(policy, tcases, t)
++}
+diff --git a/pkg/kubelet/cm/topologymanager/policy_restricted.go b/pkg/kubelet/cm/topologymanager/policy_restricted.go
+index 5ee2f245d63..6cda7e0a049 100644
+--- a/pkg/kubelet/cm/topologymanager/policy_restricted.go
++++ b/pkg/kubelet/cm/topologymanager/policy_restricted.go
+@@ -38,9 +38,9 @@ func (p *restrictedPolicy) canAdmitPodResult(hint *TopologyHint) bool {
+ 	return hint.Preferred
+ }
+ 
+-func (p *restrictedPolicy) Merge(providersHints []map[string][]TopologyHint) (TopologyHint, bool) {
+-	filteredHints := filterProvidersHints(providersHints)
++func (p *restrictedPolicy) Merge(providersHints []map[string][]TopologyHint) (map[string]TopologyHint, bool) {
++	filteredHints, resourceNames := filterProvidersHints(providersHints)
+ 	hint := mergeFilteredHints(p.numaNodes, filteredHints)
+ 	admit := p.canAdmitPodResult(&hint)
+-	return hint, admit
++	return generateResourceHints(resourceNames, hint), admit
+ }
+diff --git a/pkg/kubelet/cm/topologymanager/policy_single_numa_node.go b/pkg/kubelet/cm/topologymanager/policy_single_numa_node.go
+index 7745951c085..dc848e0e490 100644
+--- a/pkg/kubelet/cm/topologymanager/policy_single_numa_node.go
++++ b/pkg/kubelet/cm/topologymanager/policy_single_numa_node.go
+@@ -61,8 +61,8 @@ func filterSingleNumaHints(allResourcesHints [][]TopologyHint) [][]TopologyHint
+ 	return filteredResourcesHints
+ }
+ 
+-func (p *singleNumaNodePolicy) Merge(providersHints []map[string][]TopologyHint) (TopologyHint, bool) {
+-	filteredHints := filterProvidersHints(providersHints)
++func (p *singleNumaNodePolicy) Merge(providersHints []map[string][]TopologyHint) (map[string]TopologyHint, bool) {
++	filteredHints, resourceNames := filterProvidersHints(providersHints)
+ 	// Filter to only include don't cares and hints with a single NUMA node.
+ 	singleNumaHints := filterSingleNumaHints(filteredHints)
+ 	bestHint := mergeFilteredHints(p.numaNodes, singleNumaHints)
+@@ -73,5 +73,5 @@ func (p *singleNumaNodePolicy) Merge(providersHints []map[string][]TopologyHint)
+ 	}
+ 
+ 	admit := p.canAdmitPodResult(&bestHint)
+-	return bestHint, admit
++	return generateResourceHints(resourceNames, bestHint), admit
+ }
+diff --git a/pkg/kubelet/cm/topologymanager/policy_test.go b/pkg/kubelet/cm/topologymanager/policy_test.go
+index df9f7e8d5f6..e0e7ad40b22 100644
+--- a/pkg/kubelet/cm/topologymanager/policy_test.go
++++ b/pkg/kubelet/cm/topologymanager/policy_test.go
+@@ -27,7 +27,7 @@ import (
+ type policyMergeTestCase struct {
+ 	name     string
+ 	hp       []HintProvider
+-	expected TopologyHint
++	expected map[string]TopologyHint
+ }
+ 
+ func commonPolicyMergeTestCases(numaNodes []int) []policyMergeTestCase {
+@@ -56,9 +56,15 @@ func commonPolicyMergeTestCases(numaNodes []int) []policyMergeTestCase {
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: NewTestBitMask(0),
+-				Preferred:        true,
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        true,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        true,
++				},
+ 			},
+ 		},
+ 		{
+@@ -85,9 +91,15 @@ func commonPolicyMergeTestCases(numaNodes []int) []policyMergeTestCase {
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: NewTestBitMask(1),
+-				Preferred:        true,
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(1),
++					Preferred:        true,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(1),
++					Preferred:        true,
++				},
+ 			},
+ 		},
+ 		{
+@@ -105,9 +117,15 @@ func commonPolicyMergeTestCases(numaNodes []int) []policyMergeTestCase {
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: NewTestBitMask(0),
+-				Preferred:        true,
++			expected: map[string]TopologyHint{
++				defaultResourceKey: {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        true,
++				},
++				"resource": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        true,
++				},
+ 			},
+ 		},
+ 		{
+@@ -125,9 +143,15 @@ func commonPolicyMergeTestCases(numaNodes []int) []policyMergeTestCase {
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: NewTestBitMask(1),
+-				Preferred:        true,
++			expected: map[string]TopologyHint{
++				defaultResourceKey: {
++					NUMANodeAffinity: NewTestBitMask(1),
++					Preferred:        true,
++				},
++				"resource": {
++					NUMANodeAffinity: NewTestBitMask(1),
++					Preferred:        true,
++				},
+ 			},
+ 		},
+ 		{
+@@ -158,9 +182,15 @@ func commonPolicyMergeTestCases(numaNodes []int) []policyMergeTestCase {
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: NewTestBitMask(0),
+-				Preferred:        true,
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        true,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        true,
++				},
+ 			},
+ 		},
+ 		{
+@@ -191,9 +221,15 @@ func commonPolicyMergeTestCases(numaNodes []int) []policyMergeTestCase {
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: NewTestBitMask(1),
+-				Preferred:        true,
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(1),
++					Preferred:        true,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(1),
++					Preferred:        true,
++				},
+ 			},
+ 		},
+ 		{
+@@ -228,9 +264,15 @@ func commonPolicyMergeTestCases(numaNodes []int) []policyMergeTestCase {
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: NewTestBitMask(0),
+-				Preferred:        true,
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        true,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        true,
++				},
+ 			},
+ 		},
+ 		{
+@@ -269,9 +311,15 @@ func commonPolicyMergeTestCases(numaNodes []int) []policyMergeTestCase {
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: NewTestBitMask(1),
+-				Preferred:        true,
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(1),
++					Preferred:        true,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(1),
++					Preferred:        true,
++				},
+ 			},
+ 		},
+ 		{
+@@ -306,9 +354,15 @@ func commonPolicyMergeTestCases(numaNodes []int) []policyMergeTestCase {
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: NewTestBitMask(1),
+-				Preferred:        true,
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(1),
++					Preferred:        true,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(1),
++					Preferred:        true,
++				},
+ 			},
+ 		},
+ 	}
+@@ -348,17 +402,25 @@ func (p *bestEffortPolicy) mergeTestCases(numaNodes []int) []policyMergeTestCase
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: NewTestBitMask(0, 1),
+-				Preferred:        true,
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(0, 1),
++					Preferred:        true,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(0, 1),
++					Preferred:        true,
++				},
+ 			},
+ 		},
+ 		{
+ 			name: "TopologyHint not set",
+ 			hp:   []HintProvider{},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: NewTestBitMask(numaNodes...),
+-				Preferred:        true,
++			expected: map[string]TopologyHint{
++				defaultResourceKey: {
++					NUMANodeAffinity: NewTestBitMask(numaNodes...),
++					Preferred:        true,
++				},
+ 			},
+ 		},
+ 		{
+@@ -368,9 +430,11 @@ func (p *bestEffortPolicy) mergeTestCases(numaNodes []int) []policyMergeTestCase
+ 					map[string][]TopologyHint{},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: NewTestBitMask(numaNodes...),
+-				Preferred:        true,
++			expected: map[string]TopologyHint{
++				defaultResourceKey: {
++					NUMANodeAffinity: NewTestBitMask(numaNodes...),
++					Preferred:        true,
++				},
+ 			},
+ 		},
+ 		{
+@@ -382,9 +446,11 @@ func (p *bestEffortPolicy) mergeTestCases(numaNodes []int) []policyMergeTestCase
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: NewTestBitMask(numaNodes...),
+-				Preferred:        true,
++			expected: map[string]TopologyHint{
++				"resource": {
++					NUMANodeAffinity: NewTestBitMask(numaNodes...),
++					Preferred:        true,
++				},
+ 			},
+ 		},
+ 		{
+@@ -395,9 +461,11 @@ func (p *bestEffortPolicy) mergeTestCases(numaNodes []int) []policyMergeTestCase
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: NewTestBitMask(numaNodes...),
+-				Preferred:        false,
++			expected: map[string]TopologyHint{
++				"resource": {
++					NUMANodeAffinity: NewTestBitMask(numaNodes...),
++					Preferred:        false,
++				},
+ 			},
+ 		},
+ 		{
+@@ -414,9 +482,11 @@ func (p *bestEffortPolicy) mergeTestCases(numaNodes []int) []policyMergeTestCase
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: NewTestBitMask(numaNodes...),
+-				Preferred:        true,
++			expected: map[string]TopologyHint{
++				"resource": {
++					NUMANodeAffinity: NewTestBitMask(numaNodes...),
++					Preferred:        true,
++				},
+ 			},
+ 		},
+ 		{
+@@ -433,9 +503,11 @@ func (p *bestEffortPolicy) mergeTestCases(numaNodes []int) []policyMergeTestCase
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: NewTestBitMask(numaNodes...),
+-				Preferred:        false,
++			expected: map[string]TopologyHint{
++				"resource": {
++					NUMANodeAffinity: NewTestBitMask(numaNodes...),
++					Preferred:        false,
++				},
+ 			},
+ 		},
+ 		{
+@@ -462,9 +534,15 @@ func (p *bestEffortPolicy) mergeTestCases(numaNodes []int) []policyMergeTestCase
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: NewTestBitMask(numaNodes...),
+-				Preferred:        false,
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(numaNodes...),
++					Preferred:        false,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(numaNodes...),
++					Preferred:        false,
++				},
+ 			},
+ 		},
+ 		{
+@@ -491,9 +569,15 @@ func (p *bestEffortPolicy) mergeTestCases(numaNodes []int) []policyMergeTestCase
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: NewTestBitMask(0),
+-				Preferred:        false,
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        false,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        false,
++				},
+ 			},
+ 		},
+ 		{
+@@ -520,9 +604,15 @@ func (p *bestEffortPolicy) mergeTestCases(numaNodes []int) []policyMergeTestCase
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: NewTestBitMask(1),
+-				Preferred:        false,
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(1),
++					Preferred:        false,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(1),
++					Preferred:        false,
++				},
+ 			},
+ 		},
+ 		{
+@@ -549,9 +639,15 @@ func (p *bestEffortPolicy) mergeTestCases(numaNodes []int) []policyMergeTestCase
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: NewTestBitMask(0),
+-				Preferred:        false,
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        false,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        false,
++				},
+ 			},
+ 		},
+ 		{
+@@ -582,9 +678,15 @@ func (p *bestEffortPolicy) mergeTestCases(numaNodes []int) []policyMergeTestCase
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: NewTestBitMask(0),
+-				Preferred:        false,
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        false,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        false,
++				},
+ 			},
+ 		},
+ 		{
+@@ -611,9 +713,15 @@ func (p *bestEffortPolicy) mergeTestCases(numaNodes []int) []policyMergeTestCase
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: NewTestBitMask(1),
+-				Preferred:        false,
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(1),
++					Preferred:        false,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(1),
++					Preferred:        false,
++				},
+ 			},
+ 		},
+ 		{
+@@ -644,9 +752,15 @@ func (p *bestEffortPolicy) mergeTestCases(numaNodes []int) []policyMergeTestCase
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: NewTestBitMask(0, 1),
+-				Preferred:        false,
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(0, 1),
++					Preferred:        false,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(0, 1),
++					Preferred:        false,
++				},
+ 			},
+ 		},
+ 		{
+@@ -677,9 +791,15 @@ func (p *bestEffortPolicy) mergeTestCases(numaNodes []int) []policyMergeTestCase
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: NewTestBitMask(0, 3),
+-				Preferred:        false,
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(0, 3),
++					Preferred:        false,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(0, 3),
++					Preferred:        false,
++				},
+ 			},
+ 		},
+ 		{
+@@ -710,9 +830,15 @@ func (p *bestEffortPolicy) mergeTestCases(numaNodes []int) []policyMergeTestCase
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: NewTestBitMask(1, 2),
+-				Preferred:        false,
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(1, 2),
++					Preferred:        false,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(1, 2),
++					Preferred:        false,
++				},
+ 			},
+ 		},
+ 		{
+@@ -743,9 +869,15 @@ func (p *bestEffortPolicy) mergeTestCases(numaNodes []int) []policyMergeTestCase
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: NewTestBitMask(2, 3),
+-				Preferred:        false,
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(2, 3),
++					Preferred:        false,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(2, 3),
++					Preferred:        false,
++				},
+ 			},
+ 		},
+ 		{
+@@ -780,9 +912,15 @@ func (p *bestEffortPolicy) mergeTestCases(numaNodes []int) []policyMergeTestCase
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: NewTestBitMask(1, 2),
+-				Preferred:        false,
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(1, 2),
++					Preferred:        false,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(1, 2),
++					Preferred:        false,
++				},
+ 			},
+ 		},
+ 		{
+@@ -825,9 +963,15 @@ func (p *bestEffortPolicy) mergeTestCases(numaNodes []int) []policyMergeTestCase
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: NewTestBitMask(1, 2),
+-				Preferred:        false,
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(1, 2),
++					Preferred:        false,
++				},
++				"resource2": {
++					NUMANodeAffinity: NewTestBitMask(1, 2),
++					Preferred:        false,
++				},
+ 			},
+ 		},
+ 	}
+@@ -838,9 +982,11 @@ func (p *singleNumaNodePolicy) mergeTestCases(numaNodes []int) []policyMergeTest
+ 		{
+ 			name: "TopologyHint not set",
+ 			hp:   []HintProvider{},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: nil,
+-				Preferred:        true,
++			expected: map[string]TopologyHint{
++				defaultResourceKey: {
++					NUMANodeAffinity: nil,
++					Preferred:        true,
++				},
+ 			},
+ 		},
+ 		{
+@@ -850,9 +996,11 @@ func (p *singleNumaNodePolicy) mergeTestCases(numaNodes []int) []policyMergeTest
+ 					map[string][]TopologyHint{},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: nil,
+-				Preferred:        true,
++			expected: map[string]TopologyHint{
++				defaultResourceKey: {
++					NUMANodeAffinity: nil,
++					Preferred:        true,
++				},
+ 			},
+ 		},
+ 		{
+@@ -864,9 +1012,11 @@ func (p *singleNumaNodePolicy) mergeTestCases(numaNodes []int) []policyMergeTest
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: nil,
+-				Preferred:        true,
++			expected: map[string]TopologyHint{
++				"resource": {
++					NUMANodeAffinity: nil,
++					Preferred:        true,
++				},
+ 			},
+ 		},
+ 		{
+@@ -877,9 +1027,11 @@ func (p *singleNumaNodePolicy) mergeTestCases(numaNodes []int) []policyMergeTest
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: nil,
+-				Preferred:        false,
++			expected: map[string]TopologyHint{
++				"resource": {
++					NUMANodeAffinity: nil,
++					Preferred:        false,
++				},
+ 			},
+ 		},
+ 		{
+@@ -896,9 +1048,11 @@ func (p *singleNumaNodePolicy) mergeTestCases(numaNodes []int) []policyMergeTest
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: nil,
+-				Preferred:        true,
++			expected: map[string]TopologyHint{
++				"resource": {
++					NUMANodeAffinity: nil,
++					Preferred:        true,
++				},
+ 			},
+ 		},
+ 		{
+@@ -915,9 +1069,11 @@ func (p *singleNumaNodePolicy) mergeTestCases(numaNodes []int) []policyMergeTest
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: nil,
+-				Preferred:        false,
++			expected: map[string]TopologyHint{
++				"resource": {
++					NUMANodeAffinity: nil,
++					Preferred:        false,
++				},
+ 			},
+ 		},
+ 		{
+@@ -944,9 +1100,15 @@ func (p *singleNumaNodePolicy) mergeTestCases(numaNodes []int) []policyMergeTest
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: nil,
+-				Preferred:        false,
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: nil,
++					Preferred:        false,
++				},
++				"resource2": {
++					NUMANodeAffinity: nil,
++					Preferred:        false,
++				},
+ 			},
+ 		},
+ 		{
+@@ -973,9 +1135,15 @@ func (p *singleNumaNodePolicy) mergeTestCases(numaNodes []int) []policyMergeTest
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: nil,
+-				Preferred:        false,
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: nil,
++					Preferred:        false,
++				},
++				"resource2": {
++					NUMANodeAffinity: nil,
++					Preferred:        false,
++				},
+ 			},
+ 		},
+ 		{
+@@ -1002,9 +1170,15 @@ func (p *singleNumaNodePolicy) mergeTestCases(numaNodes []int) []policyMergeTest
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: nil,
+-				Preferred:        false,
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: nil,
++					Preferred:        false,
++				},
++				"resource2": {
++					NUMANodeAffinity: nil,
++					Preferred:        false,
++				},
+ 			},
+ 		},
+ 		{
+@@ -1035,9 +1209,15 @@ func (p *singleNumaNodePolicy) mergeTestCases(numaNodes []int) []policyMergeTest
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: nil,
+-				Preferred:        false,
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: nil,
++					Preferred:        false,
++				},
++				"resource2": {
++					NUMANodeAffinity: nil,
++					Preferred:        false,
++				},
+ 			},
+ 		},
+ 		{
+@@ -1068,9 +1248,15 @@ func (p *singleNumaNodePolicy) mergeTestCases(numaNodes []int) []policyMergeTest
+ 					},
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: nil,
+-				Preferred:        false,
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: nil,
++					Preferred:        false,
++				},
++				"resource2": {
++					NUMANodeAffinity: nil,
++					Preferred:        false,
++				},
+ 			},
+ 		},
+ 		{
+@@ -1098,9 +1284,15 @@ func (p *singleNumaNodePolicy) mergeTestCases(numaNodes []int) []policyMergeTest
+ 					nil,
+ 				},
+ 			},
+-			expected: TopologyHint{
+-				NUMANodeAffinity: NewTestBitMask(0),
+-				Preferred:        true,
++			expected: map[string]TopologyHint{
++				"resource1": {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        true,
++				},
++				defaultResourceKey: {
++					NUMANodeAffinity: NewTestBitMask(0),
++					Preferred:        true,
++				},
+ 			},
+ 		},
+ 	}
+diff --git a/pkg/kubelet/cm/topologymanager/scope.go b/pkg/kubelet/cm/topologymanager/scope.go
+index 912aba3fde0..e0f09fb69f7 100644
+--- a/pkg/kubelet/cm/topologymanager/scope.go
++++ b/pkg/kubelet/cm/topologymanager/scope.go
+@@ -55,7 +55,7 @@ type scope struct {
+ 	name  string
+ 	// Mapping of a Pods mapping of Containers and their TopologyHints
+ 	// Indexed by PodUID to ContainerName
+-	podTopologyHints podTopologyHints
++	podTopologyHints map[string]podTopologyHints
+ 	// The list of components registered with the Manager
+ 	hintProviders []HintProvider
+ 	// Topology Manager Policy
+@@ -68,24 +68,29 @@ func (s *scope) Name() string {
+ 	return s.name
+ }
+ 
+-func (s *scope) getTopologyHints(podUID string, containerName string) TopologyHint {
++// getTopologyHints param [resourceName] is optional
++func (s *scope) getTopologyHints(podUID string, containerName string, resourceName string) TopologyHint {
+ 	s.mutex.Lock()
+ 	defer s.mutex.Unlock()
+-	return s.podTopologyHints[podUID][containerName]
++	hint, ok := s.podTopologyHints[podUID][containerName][resourceName]
++	if ok {
++		return hint
++	}
++	return s.podTopologyHints[podUID][containerName][defaultResourceKey]
+ }
+ 
+-func (s *scope) setTopologyHints(podUID string, containerName string, th TopologyHint) {
++func (s *scope) setTopologyHints(podUID string, containerName string, th map[string]TopologyHint) {
+ 	s.mutex.Lock()
+ 	defer s.mutex.Unlock()
+ 
+ 	if s.podTopologyHints[podUID] == nil {
+-		s.podTopologyHints[podUID] = make(map[string]TopologyHint)
++		s.podTopologyHints[podUID] = make(map[string]map[string]TopologyHint)
+ 	}
+ 	s.podTopologyHints[podUID][containerName] = th
+ }
+ 
+-func (s *scope) GetAffinity(podUID string, containerName string) TopologyHint {
+-	return s.getTopologyHints(podUID, containerName)
++func (s *scope) GetAffinity(podUID string, containerName string, resourceName string) TopologyHint {
++	return s.getTopologyHints(podUID, containerName, resourceName)
+ }
+ 
+ func (s *scope) AddHintProvider(h HintProvider) {
+diff --git a/pkg/kubelet/cm/topologymanager/scope_container.go b/pkg/kubelet/cm/topologymanager/scope_container.go
+index 1e4e2f58fc0..4c34f539a91 100644
+--- a/pkg/kubelet/cm/topologymanager/scope_container.go
++++ b/pkg/kubelet/cm/topologymanager/scope_container.go
+@@ -36,7 +36,7 @@ func NewContainerScope(policy Policy) Scope {
+ 	return &containerScope{
+ 		scope{
+ 			name:             containerTopologyScope,
+-			podTopologyHints: podTopologyHints{},
++			podTopologyHints: map[string]podTopologyHints{},
+ 			policy:           policy,
+ 			podMap:           containermap.NewContainerMap(),
+ 		},
+@@ -79,7 +79,7 @@ func (s *containerScope) accumulateProvidersHints(pod *v1.Pod, container *v1.Con
+ 	return providersHints
+ }
+ 
+-func (s *containerScope) calculateAffinity(pod *v1.Pod, container *v1.Container) (TopologyHint, bool) {
++func (s *containerScope) calculateAffinity(pod *v1.Pod, container *v1.Container) (map[string]TopologyHint, bool) {
+ 	providersHints := s.accumulateProvidersHints(pod, container)
+ 	bestHint, admit := s.policy.Merge(providersHints)
+ 	klog.InfoS("ContainerTopologyHint", "bestHint", bestHint)
+diff --git a/pkg/kubelet/cm/topologymanager/scope_pod.go b/pkg/kubelet/cm/topologymanager/scope_pod.go
+index b77682597b8..4c234598dec 100644
+--- a/pkg/kubelet/cm/topologymanager/scope_pod.go
++++ b/pkg/kubelet/cm/topologymanager/scope_pod.go
+@@ -36,7 +36,7 @@ func NewPodScope(policy Policy) Scope {
+ 	return &podScope{
+ 		scope{
+ 			name:             podTopologyScope,
+-			podTopologyHints: podTopologyHints{},
++			podTopologyHints: map[string]podTopologyHints{},
+ 			policy:           policy,
+ 			podMap:           containermap.NewContainerMap(),
+ 		},
+@@ -79,7 +79,7 @@ func (s *podScope) accumulateProvidersHints(pod *v1.Pod) []map[string][]Topology
+ 	return providersHints
+ }
+ 
+-func (s *podScope) calculateAffinity(pod *v1.Pod) (TopologyHint, bool) {
++func (s *podScope) calculateAffinity(pod *v1.Pod) (map[string]TopologyHint, bool) {
+ 	providersHints := s.accumulateProvidersHints(pod)
+ 	bestHint, admit := s.policy.Merge(providersHints)
+ 	klog.InfoS("PodTopologyHint", "bestHint", bestHint)
+diff --git a/pkg/kubelet/cm/topologymanager/scope_test.go b/pkg/kubelet/cm/topologymanager/scope_test.go
+index bb0dccf0a90..cef4bda1010 100644
+--- a/pkg/kubelet/cm/topologymanager/scope_test.go
++++ b/pkg/kubelet/cm/topologymanager/scope_test.go
+@@ -40,7 +40,7 @@ func TestGetAffinity(t *testing.T) {
+ 	}
+ 	for _, tc := range tcases {
+ 		scope := scope{}
+-		actual := scope.GetAffinity(tc.podUID, tc.containerName)
++		actual := scope.GetAffinity(tc.podUID, tc.containerName, v1.ResourceCPU.String())
+ 		if !reflect.DeepEqual(actual, tc.expected) {
+ 			t.Errorf("Expected Affinity in result to be %v, got %v", tc.expected, actual)
+ 		}
+@@ -103,11 +103,13 @@ func TestRemoveContainer(t *testing.T) {
+ 	var lenHints1, lenHints2 int
+ 	scope := scope{}
+ 	scope.podMap = containermap.NewContainerMap()
+-	scope.podTopologyHints = podTopologyHints{}
++	scope.podTopologyHints = map[string]podTopologyHints{}
+ 	for _, tc := range testCases {
+ 		scope.podMap.Add(string(tc.podUID), tc.name, tc.containerID)
+-		scope.podTopologyHints[string(tc.podUID)] = make(map[string]TopologyHint)
+-		scope.podTopologyHints[string(tc.podUID)][tc.name] = TopologyHint{}
++		scope.podTopologyHints[string(tc.podUID)] = podTopologyHints{}
++		scope.podTopologyHints[string(tc.podUID)][tc.name] = map[string]TopologyHint{
++			defaultResourceKey: {},
++		}
+ 		len1 = len(scope.podMap)
+ 		lenHints1 = len(scope.podTopologyHints)
+ 		err := scope.RemoveContainer(tc.containerID)
+diff --git a/pkg/kubelet/cm/topologymanager/topology_manager.go b/pkg/kubelet/cm/topologymanager/topology_manager.go
+index 7cd67d1aa60..5dde6e95929 100644
+--- a/pkg/kubelet/cm/topologymanager/topology_manager.go
++++ b/pkg/kubelet/cm/topologymanager/topology_manager.go
+@@ -38,6 +38,9 @@ const (
+ 	maxAllowableNUMANodes = 8
+ 	// ErrorTopologyAffinity represents the type for a TopologyAffinityError
+ 	ErrorTopologyAffinity = "TopologyAffinityError"
++	// defaultResourceKey is the key to store the default hint for those resourceNames
++	// which don't specify hint.
++	defaultResourceKey = "*"
+ )
+ 
+ // TopologyAffinityError represents an resource alignment error
+@@ -94,7 +97,7 @@ type HintProvider interface {
+ 
+ //Store interface is to allow Hint Providers to retrieve pod affinity
+ type Store interface {
+-	GetAffinity(podUID string, containerName string) TopologyHint
++	GetAffinity(podUID string, containerName string, resourceName string) TopologyHint
+ }
+ 
+ // TopologyHint is a struct containing the NUMANodeAffinity for a Container
+@@ -126,10 +129,21 @@ func (th *TopologyHint) LessThan(other TopologyHint) bool {
+ 	return th.NUMANodeAffinity.IsNarrowerThan(other.NUMANodeAffinity)
+ }
+ 
++// DeepCopyTopologyHints returns deep copied hints of source hints
++func DeepCopyTopologyHints(srcHints []TopologyHint) []TopologyHint {
++	if srcHints == nil {
++		return nil
++	}
++
++	dstHints := make([]TopologyHint, 0, len(srcHints))
++
++	return append(dstHints, srcHints...)
++}
++
+ var _ Manager = &manager{}
+ 
+ // NewManager creates a new TopologyManager based on provided policy and scope
+-func NewManager(topology []cadvisorapi.Node, topologyPolicyName string, topologyScopeName string) (Manager, error) {
++func NewManager(topology []cadvisorapi.Node, topologyPolicyName string, topologyScopeName string, numericAlignResources []string) (Manager, error) {
+ 	klog.InfoS("Creating topology manager with policy per scope", "topologyPolicyName", topologyPolicyName, "topologyScopeName", topologyScopeName)
+ 
+ 	var numaNodes []int
+@@ -156,6 +170,9 @@ func NewManager(topology []cadvisorapi.Node, topologyPolicyName string, topology
+ 	case PolicySingleNumaNode:
+ 		policy = NewSingleNumaNodePolicy(numaNodes)
+ 
++	case PolicyNumeric:
++		policy = NewNumericPolicy(numericAlignResources)
++
+ 	default:
+ 		return nil, fmt.Errorf("unknown policy: \"%s\"", topologyPolicyName)
+ 	}
+@@ -180,8 +197,8 @@ func NewManager(topology []cadvisorapi.Node, topologyPolicyName string, topology
+ 	return manager, nil
+ }
+ 
+-func (m *manager) GetAffinity(podUID string, containerName string) TopologyHint {
+-	return m.scope.GetAffinity(podUID, containerName)
++func (m *manager) GetAffinity(podUID string, containerName string, resourceName string) TopologyHint {
++	return m.scope.GetAffinity(podUID, containerName, resourceName)
+ }
+ 
+ func (m *manager) AddHintProvider(h HintProvider) {
+diff --git a/pkg/kubelet/cm/topologymanager/topology_manager_test.go b/pkg/kubelet/cm/topologymanager/topology_manager_test.go
+index c0cc0980c65..9c3ad70ebee 100644
+--- a/pkg/kubelet/cm/topologymanager/topology_manager_test.go
++++ b/pkg/kubelet/cm/topologymanager/topology_manager_test.go
+@@ -66,7 +66,7 @@ func TestNewManager(t *testing.T) {
+ 	}
+ 
+ 	for _, tc := range tcases {
+-		mngr, err := NewManager(nil, tc.policyName, "container")
++		mngr, err := NewManager(nil, tc.policyName, "container", defaultAlignResourceNames)
+ 
+ 		if tc.expectedError != nil {
+ 			if !strings.Contains(err.Error(), tc.expectedError.Error()) {
+@@ -107,7 +107,7 @@ func TestManagerScope(t *testing.T) {
+ 	}
+ 
+ 	for _, tc := range tcases {
+-		mngr, err := NewManager(nil, "best-effort", tc.scopeName)
++		mngr, err := NewManager(nil, "best-effort", tc.scopeName, nil)
+ 
+ 		if tc.expectedError != nil {
+ 			if !strings.Contains(err.Error(), tc.expectedError.Error()) {
+@@ -147,9 +147,9 @@ type mockPolicy struct {
+ 	ph []map[string][]TopologyHint
+ }
+ 
+-func (p *mockPolicy) Merge(providersHints []map[string][]TopologyHint) (TopologyHint, bool) {
++func (p *mockPolicy) Merge(providersHints []map[string][]TopologyHint) (map[string]TopologyHint, bool) {
+ 	p.ph = providersHints
+-	return TopologyHint{}, true
++	return generateResourceHints([]string{defaultResourceKey}, TopologyHint{}), true
+ }
+ 
+ func TestAddHintProvider(t *testing.T) {
 diff --git a/pkg/kubelet/container/helpers.go b/pkg/kubelet/container/helpers.go
 index a9be02a32d6..89ba48152cf 100644
 --- a/pkg/kubelet/container/helpers.go
@@ -6526,10 +9066,20 @@ index 127192e00f7..6de9b72d17d 100644
  	if err != nil {
  		klog.ErrorS(err, "Failed to create listener for podResources endpoint")
 diff --git a/staging/src/k8s.io/kubelet/config/v1beta1/types.go b/staging/src/k8s.io/kubelet/config/v1beta1/types.go
-index 2b397b9d34c..b5f6b349746 100644
+index 2b397b9d34c..c0ad92e94e5 100644
 --- a/staging/src/k8s.io/kubelet/config/v1beta1/types.go
 +++ b/staging/src/k8s.io/kubelet/config/v1beta1/types.go
-@@ -372,6 +372,13 @@ type KubeletConfiguration struct {
+@@ -68,6 +68,9 @@ const (
+ 	// SingleNumaNodeTopologyManagerPolicy is a mode in which kubelet only allows
+ 	// pods with a single NUMA alignment of CPU and device resources.
+ 	SingleNumaNodeTopologyManagerPolicy = "single-numa-node"
++	// NumericTopologyManagerPolicy is a mode in which kubelet align resource
++	// with widest NUMAs
++	NumericTopologyManagerPolicy = "numeric"
+ 	// ContainerTopologyManagerScope represents that
+ 	// topology policy is applied on a per-container basis.
+ 	ContainerTopologyManagerScope = "container"
+@@ -372,6 +375,13 @@ type KubeletConfiguration struct {
  	// Default: "none"
  	// +optional
  	TopologyManagerPolicy string `json:"topologyManagerPolicy,omitempty"`
@@ -6543,7 +9093,7 @@ index 2b397b9d34c..b5f6b349746 100644
  	// topologyManagerScope represents the scope of topology hint generation
  	// that topology manager requests and hint providers generate. Valid values include:
  	//
-@@ -382,6 +389,11 @@ type KubeletConfiguration struct {
+@@ -382,6 +392,11 @@ type KubeletConfiguration struct {
  	// Default: "container"
  	// +optional
  	TopologyManagerScope string `json:"topologyManagerScope,omitempty"`
@@ -6555,8 +9105,20 @@ index 2b397b9d34c..b5f6b349746 100644
  	// qosReserved is a set of resource name to percentage pairs that specify
  	// the minimum percentage of a resource reserved for exclusive use by the
  	// guaranteed QoS tier.
+@@ -590,6 +605,11 @@ type KubeletConfiguration struct {
+ 	// Default: "Watch"
+ 	// +optional
+ 	ConfigMapAndSecretChangeDetectionStrategy ResourceChangeDetectionStrategy `json:"configMapAndSecretChangeDetectionStrategy,omitempty"`
++	// NumericTopologyAlignResources is a list of resources which need to be aligned numa affinity
++	// in numeric topology policy.
++	// Default: [cpu, memory]
++	// +optional
++	NumericTopologyAlignResources []string `json:"numericTopologyAlignResources,omitempty"`
+ 
+ 	/* the following fields are meant for Node Allocatable */
+ 
 diff --git a/staging/src/k8s.io/kubelet/config/v1beta1/zz_generated.deepcopy.go b/staging/src/k8s.io/kubelet/config/v1beta1/zz_generated.deepcopy.go
-index 0468c25e051..a5f7db6a75c 100644
+index 0468c25e051..d289acce13e 100644
 --- a/staging/src/k8s.io/kubelet/config/v1beta1/zz_generated.deepcopy.go
 +++ b/staging/src/k8s.io/kubelet/config/v1beta1/zz_generated.deepcopy.go
 @@ -260,6 +260,14 @@ func (in *KubeletConfiguration) DeepCopyInto(out *KubeletConfiguration) {
@@ -6573,6 +9135,18 @@ index 0468c25e051..a5f7db6a75c 100644
 +	}
  	if in.QOSReserved != nil {
  		in, out := &in.QOSReserved, &out.QOSReserved
+ 		*out = make(map[string]string, len(*in))
+@@ -370,6 +378,11 @@ func (in *KubeletConfiguration) DeepCopyInto(out *KubeletConfiguration) {
+ 		*out = new(int32)
+ 		**out = **in
+ 	}
++	if in.NumericTopologyAlignResources != nil {
++		in, out := &in.NumericTopologyAlignResources, &out.NumericTopologyAlignResources
++		*out = make([]string, len(*in))
++		copy(*out, *in)
++	}
+ 	if in.SystemReserved != nil {
+ 		in, out := &in.SystemReserved, &out.SystemReserved
  		*out = make(map[string]string, len(*in))
 diff --git a/staging/src/k8s.io/kubelet/go.sum b/staging/src/k8s.io/kubelet/go.sum
 index 5b68822ef82..c86f0d6427a 100644
