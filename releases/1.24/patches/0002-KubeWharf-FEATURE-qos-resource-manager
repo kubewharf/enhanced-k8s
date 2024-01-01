@@ -1421,10 +1421,10 @@ index 00000000000..c7f5be9ba13
 +}
 diff --git a/pkg/kubelet/cm/qosresourcemanager/manager.go b/pkg/kubelet/cm/qosresourcemanager/manager.go
 new file mode 100644
-index 00000000000..8fbef63043e
+index 00000000000..6d3cc953f8f
 --- /dev/null
 +++ b/pkg/kubelet/cm/qosresourcemanager/manager.go
-@@ -0,0 +1,1261 @@
+@@ -0,0 +1,1263 @@
 +/*
 +Copyright 2017 The Kubernetes Authors.
 +
@@ -1634,6 +1634,8 @@ index 00000000000..8fbef63043e
 +	err := m.readCheckpoint()
 +	if err != nil {
 +		klog.Warningf("[qosresourcemanager] Continue after failing to read checkpoint file. Resource allocation info may NOT be up-to-date. Err: %v", err)
++	} else {
++		klog.Infof("[qosresourcemanager.Start] readCheckpoint successfully")
 +	}
 +
 +	socketPath := filepath.Join(m.socketdir, m.socketname)
@@ -4164,10 +4166,10 @@ index 00000000000..f6bb9a8c1f5
 +}
 diff --git a/pkg/kubelet/cm/qosresourcemanager/pod_resources.go b/pkg/kubelet/cm/qosresourcemanager/pod_resources.go
 new file mode 100644
-index 00000000000..fe8ee579fba
+index 00000000000..cf44e6986fa
 --- /dev/null
 +++ b/pkg/kubelet/cm/qosresourcemanager/pod_resources.go
-@@ -0,0 +1,401 @@
+@@ -0,0 +1,402 @@
 +/*
 +Copyright 2017 The Kubernetes Authors.
 +
@@ -4187,6 +4189,7 @@ index 00000000000..fe8ee579fba
 +package qosresourcemanager
 +
 +import (
++	"encoding/json"
 +	"fmt"
 +	"reflect"
 +	"strconv"
@@ -4388,7 +4391,7 @@ index 00000000000..fe8ee579fba
 +	for podUID, containerResources := range pres.resources {
 +		for conName, resourcesAllocation := range containerResources {
 +			for resourceName, allocationInfo := range resourcesAllocation {
-+				allocRespBytes, err := allocationInfo.Marshal()
++				allocRespBytes, err := json.Marshal(allocationInfo)
 +				if err != nil {
 +					klog.Errorf("Can't marshal allocationInfo for %v %v %v: %v", podUID, conName, resourceName, err)
 +					continue
@@ -4410,7 +4413,7 @@ index 00000000000..fe8ee579fba
 +		klog.V(2).Infof("Get checkpoint entry: %s %s %s %s\n",
 +			entry.PodUID, entry.ContainerName, entry.ResourceName, entry.AllocationInfo)
 +		allocationInfo := &pluginapi.ResourceAllocationInfo{}
-+		err := allocationInfo.Unmarshal([]byte(entry.AllocationInfo))
++		err := json.Unmarshal([]byte(entry.AllocationInfo), allocationInfo)
 +		if err != nil {
 +			klog.Errorf("Can't unmarshal allocationInfo for %s %s %s %s: %v",
 +				entry.PodUID, entry.ContainerName, entry.ResourceName, entry.AllocationInfo, err)
@@ -5869,6 +5872,26 @@ index 00000000000..879aa6eea4e
 +
 +	return pod.Annotations[pluginapi.KatalystSkipQRMAdmitAnnotationKey] == pluginapi.KatalystValueTrue
 +}
+diff --git a/pkg/kubelet/config/sources.go b/pkg/kubelet/config/sources.go
+index a8ac11eb04f..d3806248466 100644
+--- a/pkg/kubelet/config/sources.go
++++ b/pkg/kubelet/config/sources.go
+@@ -21,6 +21,7 @@ import (
+ 	"sync"
+ 
+ 	"k8s.io/apimachinery/pkg/util/sets"
++	"k8s.io/klog/v2"
+ )
+ 
+ // SourcesReadyFn is function that returns true if the specified sources have been seen.
+@@ -56,6 +57,7 @@ type sourcesImpl struct {
+ func (s *sourcesImpl) AddSource(source string) {
+ 	s.lock.Lock()
+ 	defer s.lock.Unlock()
++	klog.Infof("[AddSource] add source: %s", source)
+ 	s.sourcesSeen.Insert(source)
+ }
+ 
 diff --git a/pkg/kubelet/container/helpers.go b/pkg/kubelet/container/helpers.go
 index a9be02a32d6..89ba48152cf 100644
 --- a/pkg/kubelet/container/helpers.go
