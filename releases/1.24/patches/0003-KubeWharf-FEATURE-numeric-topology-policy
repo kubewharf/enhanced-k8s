@@ -252,10 +252,10 @@ index a872b389c46..723b35b89d6 100644
  
  		// Allocate CPUs according to the NUMA affinity contained in the hint.
 diff --git a/pkg/kubelet/cm/devicemanager/manager.go b/pkg/kubelet/cm/devicemanager/manager.go
-index b367aa30781..2ecbf946f26 100644
+index 506237f2b09..48455bd3b95 100644
 --- a/pkg/kubelet/cm/devicemanager/manager.go
 +++ b/pkg/kubelet/cm/devicemanager/manager.go
-@@ -800,7 +800,7 @@ func (m *ManagerImpl) devicesToAllocate(podUID, contName, resource string, requi
+@@ -805,7 +805,7 @@ func (m *ManagerImpl) devicesToAllocate(podUID, contName, resource string, requi
  
  func (m *ManagerImpl) filterByAffinity(podUID, contName, resource string, available sets.String) (sets.String, sets.String, sets.String) {
  	// If alignment information is not available, just pass the available list back.
@@ -278,10 +278,19 @@ index d1dcd7ba0e8..5948ce84e4e 100644
  
  	requestedResources, err := getRequestedResources(container)
 diff --git a/pkg/kubelet/cm/qosresourcemanager/manager.go b/pkg/kubelet/cm/qosresourcemanager/manager.go
-index 8fbef63043e..9278460f71d 100644
+index 5030a5ee477..4c21adc6aee 100644
 --- a/pkg/kubelet/cm/qosresourcemanager/manager.go
 +++ b/pkg/kubelet/cm/qosresourcemanager/manager.go
-@@ -495,7 +495,7 @@ func (m *ManagerImpl) allocateContainerResources(pod *v1.Pod, container *v1.Cont
+@@ -455,7 +455,7 @@ func (m *ManagerImpl) allocatePodResources(pod *v1.Pod, isReAllocation bool) err
+ 		}
+ 
+ 		if m.resourceHasTopologyAlignment(resource) {
+-			hint := m.topologyAffinityStore.GetAffinity(podUID, podUID)
++			hint := m.topologyAffinityStore.GetAffinity(podUID, podUID, resource)
+ 
+ 			if hint.NUMANodeAffinity == nil {
+ 				klog.Warningf("[qosresourcemanager.allocateContainerResources] pod: %s/%s; allocate resource: %s without numa nodes affinity",
+@@ -655,7 +655,7 @@ func (m *ManagerImpl) allocateContainerResources(pod *v1.Pod, container *v1.Cont
  		}
  
  		if m.resourceHasTopologyAlignment(resource) {
@@ -2377,10 +2386,10 @@ index df9f7e8d5f6..e0e7ad40b22 100644
  		},
  	}
 diff --git a/pkg/kubelet/cm/topologymanager/scope.go b/pkg/kubelet/cm/topologymanager/scope.go
-index 912aba3fde0..e0f09fb69f7 100644
+index d55e723b7b3..3fc263e9784 100644
 --- a/pkg/kubelet/cm/topologymanager/scope.go
 +++ b/pkg/kubelet/cm/topologymanager/scope.go
-@@ -55,7 +55,7 @@ type scope struct {
+@@ -56,7 +56,7 @@ type scope struct {
  	name  string
  	// Mapping of a Pods mapping of Containers and their TopologyHints
  	// Indexed by PodUID to ContainerName
@@ -2389,7 +2398,7 @@ index 912aba3fde0..e0f09fb69f7 100644
  	// The list of components registered with the Manager
  	hintProviders []HintProvider
  	// Topology Manager Policy
-@@ -68,24 +68,29 @@ func (s *scope) Name() string {
+@@ -69,24 +69,29 @@ func (s *scope) Name() string {
  	return s.name
  }
  
@@ -2448,7 +2457,7 @@ index 1e4e2f58fc0..4c34f539a91 100644
  	bestHint, admit := s.policy.Merge(providersHints)
  	klog.InfoS("ContainerTopologyHint", "bestHint", bestHint)
 diff --git a/pkg/kubelet/cm/topologymanager/scope_pod.go b/pkg/kubelet/cm/topologymanager/scope_pod.go
-index b77682597b8..4c234598dec 100644
+index df343c7d1c6..3be0410c59b 100644
 --- a/pkg/kubelet/cm/topologymanager/scope_pod.go
 +++ b/pkg/kubelet/cm/topologymanager/scope_pod.go
 @@ -36,7 +36,7 @@ func NewPodScope(policy Policy) Scope {
@@ -2460,7 +2469,7 @@ index b77682597b8..4c234598dec 100644
  			policy:           policy,
  			podMap:           containermap.NewContainerMap(),
  		},
-@@ -79,7 +79,7 @@ func (s *podScope) accumulateProvidersHints(pod *v1.Pod) []map[string][]Topology
+@@ -75,7 +75,7 @@ func (s *podScope) accumulateProvidersHints(pod *v1.Pod) []map[string][]Topology
  	return providersHints
  }
  
@@ -2500,7 +2509,7 @@ index bb0dccf0a90..cef4bda1010 100644
  		lenHints1 = len(scope.podTopologyHints)
  		err := scope.RemoveContainer(tc.containerID)
 diff --git a/pkg/kubelet/cm/topologymanager/topology_manager.go b/pkg/kubelet/cm/topologymanager/topology_manager.go
-index 7cd67d1aa60..5dde6e95929 100644
+index ebf6133317a..facd8c39776 100644
 --- a/pkg/kubelet/cm/topologymanager/topology_manager.go
 +++ b/pkg/kubelet/cm/topologymanager/topology_manager.go
 @@ -38,6 +38,9 @@ const (
@@ -2513,7 +2522,7 @@ index 7cd67d1aa60..5dde6e95929 100644
  )
  
  // TopologyAffinityError represents an resource alignment error
-@@ -94,7 +97,7 @@ type HintProvider interface {
+@@ -98,7 +101,7 @@ type HintProvider interface {
  
  //Store interface is to allow Hint Providers to retrieve pod affinity
  type Store interface {
@@ -2522,7 +2531,7 @@ index 7cd67d1aa60..5dde6e95929 100644
  }
  
  // TopologyHint is a struct containing the NUMANodeAffinity for a Container
-@@ -126,10 +129,21 @@ func (th *TopologyHint) LessThan(other TopologyHint) bool {
+@@ -130,10 +133,21 @@ func (th *TopologyHint) LessThan(other TopologyHint) bool {
  	return th.NUMANodeAffinity.IsNarrowerThan(other.NUMANodeAffinity)
  }
  
@@ -2545,7 +2554,7 @@ index 7cd67d1aa60..5dde6e95929 100644
  	klog.InfoS("Creating topology manager with policy per scope", "topologyPolicyName", topologyPolicyName, "topologyScopeName", topologyScopeName)
  
  	var numaNodes []int
-@@ -156,6 +170,9 @@ func NewManager(topology []cadvisorapi.Node, topologyPolicyName string, topology
+@@ -160,6 +174,9 @@ func NewManager(topology []cadvisorapi.Node, topologyPolicyName string, topology
  	case PolicySingleNumaNode:
  		policy = NewSingleNumaNodePolicy(numaNodes)
  
@@ -2555,7 +2564,7 @@ index 7cd67d1aa60..5dde6e95929 100644
  	default:
  		return nil, fmt.Errorf("unknown policy: \"%s\"", topologyPolicyName)
  	}
-@@ -180,8 +197,8 @@ func NewManager(topology []cadvisorapi.Node, topologyPolicyName string, topology
+@@ -184,8 +201,8 @@ func NewManager(topology []cadvisorapi.Node, topologyPolicyName string, topology
  	return manager, nil
  }
  
@@ -2567,7 +2576,7 @@ index 7cd67d1aa60..5dde6e95929 100644
  
  func (m *manager) AddHintProvider(h HintProvider) {
 diff --git a/pkg/kubelet/cm/topologymanager/topology_manager_test.go b/pkg/kubelet/cm/topologymanager/topology_manager_test.go
-index c0cc0980c65..9c3ad70ebee 100644
+index a5a7a553548..bc7011e45df 100644
 --- a/pkg/kubelet/cm/topologymanager/topology_manager_test.go
 +++ b/pkg/kubelet/cm/topologymanager/topology_manager_test.go
 @@ -66,7 +66,7 @@ func TestNewManager(t *testing.T) {
@@ -2588,7 +2597,7 @@ index c0cc0980c65..9c3ad70ebee 100644
  
  		if tc.expectedError != nil {
  			if !strings.Contains(err.Error(), tc.expectedError.Error()) {
-@@ -147,9 +147,9 @@ type mockPolicy struct {
+@@ -151,9 +151,9 @@ type mockPolicy struct {
  	ph []map[string][]TopologyHint
  }
  
