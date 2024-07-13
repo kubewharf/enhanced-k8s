@@ -11,7 +11,7 @@ jobs:
       - uses: actions/checkout@v3
 
       - name: Download kind
-        run: curl --insecure -Lo /usr/local/bin/kind https://kind.sigs.k8s.io/dl/v0.16.0/kind-linux-amd64
+        run: curl --insecure -Lo /usr/local/bin/kind https://kind.sigs.k8s.io/dl/v0.23.0/kind-linux-amd64
 
       - name: Download sonobuoy
         run: |
