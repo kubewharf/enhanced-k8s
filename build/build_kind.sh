@@ -38,7 +38,7 @@ if [[ $(docker images -q ${IMAGE}) ]]; then
   echo "image ${IMAGE} already found, skipping..."
 else
   echo
-  GOPATH=$FAKE_GOPATH kind build node-image --image="${IMAGE}"
+  GOPATH=$FAKE_GOPATH kind -v=9 build node-image --image="${IMAGE}"
   if [[ ! -z ${KIND_PAUSE_IMAGE_TAG} ]]; then
     echo "overwriting pause image with ${KIND_PAUSE_IMAGE_TAG}..."
     DOCKERFILE=$(mktemp)
@@ -52,7 +52,8 @@ fi
 
 # Start kind cluster
 echo "starting cluster for ${KUBEWHARF_K8S_VERSION}..."
-kind create cluster --image="${IMAGE}" --config="${KIND_CONFIG}" --name "${KUBEWHARF_K8S_VERSION}" --retain
+kind create cluster --image="${IMAGE}" --config="${KIND_CONFIG}" --name "${KUBEWHARF_K8S_VERSION}" --retain -v=9
+echo "finish starting cluster for ${KUBEWHARF_K8S_VERSION}..."
 echo
 
 echo "kind cluster ${KUBEWHARF_K8S_VERSION} started"
